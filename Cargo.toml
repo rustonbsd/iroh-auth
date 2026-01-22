@@ -1,0 +1,7 @@
+[package]
+name = "iroh-auth"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+iroh = { git = "https://github.com/n0-computer/iroh", branch = "main" }
