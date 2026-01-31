@@ -11,7 +11,7 @@ Ensure that only peers knowing a shared secret can connect to your iroh nodes. T
 ## Features
 
 - **Integration**: Works via standard `iroh::EndpointHooks`
-- **Security**: Uses [SPAKE2](https://github.com/brycx/spake2-rs) (Simple Password Authenticated Key Exchange) to verify secrets
+- **Security**: Uses [SPAKE2](https://github.com/RustCrypto/PAKEs/tree/master/spake2) (Simple Password Authenticated Key Exchange) to verify secrets
 - **Side-channel Resistant**: Constant time comparison for sensitive operations
 - **Zero-Config**: No certificates or complex PKI required, just a shared secret
 
