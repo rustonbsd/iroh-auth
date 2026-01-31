@@ -16,6 +16,7 @@ use n0_future::{task::spawn, time::timeout, StreamExt};
 use secrecy::{ExposeSecret, SecretSlice};
 use sha2::Sha512;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
+use subtle::ConstantTimeEq;
 
 // Errors
 #[derive(Debug)]
@@ -237,7 +238,7 @@ impl Authenticator {
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
 
-        if remote_open_key != open_key {
+        if !bool::from(remote_open_key.ct_eq(&open_key)) {
             error!("remote open_key mismatch");
             return Err(AuthenticatorError::AcceptFailed(
                 "Remote open_key mismatch".to_string(),
@@ -308,7 +309,7 @@ impl Authenticator {
                 ))
             })?;
 
-        if remote_accept_key != accept_key {
+        if !bool::from(remote_accept_key.ct_eq(&accept_key)) {
             error!("remote accept_key mismatch");
             return Err(AuthenticatorError::AcceptFailed(
                 "Remote accept_key mismatch".to_string(),

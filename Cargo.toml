@@ -10,22 +10,23 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 iroh = { version = "0.96" }
 spake2 = { version = "0.4" }
-hkdf = { version = "0.12.4" }
-secrecy = { version = "0.10.3" }
-sha2 = { version = "0.10.9" }
+hkdf = { version = "0.12" }
+secrecy = { version = "0.10" }
+sha2 = { version = "0.10" }
+subtle = { version = "2.6" }
 rand = { version = "0.9" }
 n0-future = { version = "0.3" }
 n0-watcher = { version = "0.6" }
-tracing = { version = "0.1.44" }
+tracing = { version = "0.1" }
 tokio = { version = "1" }
 
 iroh-gossip = { version = "0.96", optional = true }
 anyhow = { version = "1", optional = true}
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [features]
 gossip = ["iroh-gossip", "anyhow", "tracing-subscriber"]
-default = ["gossip"]
+default = []
 
 [[example]]
 name = "gossip"
