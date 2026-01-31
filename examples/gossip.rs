@@ -1,6 +1,6 @@
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    #[cfg(feature = "gossip")]
+    #[cfg(feature = "gossip-example")]
     {
         use iroh::PublicKey;
         use iroh::{protocol::Router, Endpoint};
@@ -42,7 +42,7 @@ async fn main() -> Result<(), String> {
             .spawn();
 
         println!(
-            "cargo run --example gossip --features=gossip -- {}",
+            "cargo run --example gossip --features=gossip-example -- {}",
             router.endpoint().id()
         );
 
@@ -121,6 +121,6 @@ async fn main() -> Result<(), String> {
         println!("Shutting down...");
         std::process::exit(0);
     }
-    #[cfg(not(feature = "gossip"))]
-    Err("gossip feature not enabled".to_string())
+    #[cfg(not(feature = "gossip-example"))]
+    Err("gossip-example feature not enabled".to_string())
 }

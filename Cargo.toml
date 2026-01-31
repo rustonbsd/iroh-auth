@@ -25,10 +25,10 @@ anyhow = { version = "1", optional = true}
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [features]
-gossip = ["iroh-gossip", "anyhow", "tracing-subscriber"]
+gossip-example = ["iroh-gossip", "anyhow", "tracing-subscriber"]
 default = []
 
 [[example]]
 name = "gossip"
 path = "examples/gossip.rs"
-required-features = ["gossip"]
+required-features = ["gossip-example"]
