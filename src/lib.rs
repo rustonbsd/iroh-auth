@@ -1,11 +1,10 @@
 use n0_watcher::Watchable;
 use std::{
     collections::BTreeSet,
-    ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{trace, debug, error, info, warn};
 
 use hkdf::Hkdf;
 use iroh::{
@@ -43,6 +42,52 @@ impl std::fmt::Display for AuthenticatorError {
 
 impl std::error::Error for AuthenticatorError {}
 
+pub trait IntoSecret {
+    fn into_secret(self) -> SecretSlice<u8>;
+}
+
+impl IntoSecret for SecretSlice<u8> {
+    fn into_secret(self) -> SecretSlice<u8> {
+        self
+    }
+}
+
+impl IntoSecret for String {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self.into_bytes().into_boxed_slice())
+    }
+}
+
+impl IntoSecret for &str {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self.as_bytes().to_vec().into_boxed_slice())
+    }
+}
+
+impl IntoSecret for Vec<u8> {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self.into_boxed_slice())
+    }
+}
+
+impl IntoSecret for &[u8] {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self.to_vec().into_boxed_slice())
+    }
+}
+
+impl<const N: usize> IntoSecret for &[u8; N] {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self.as_slice().to_vec().into_boxed_slice())
+    }
+}
+
+impl IntoSecret for Box<[u8]> {
+    fn into_secret(self) -> SecretSlice<u8> {
+        SecretSlice::new(self)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct WatchableCounter {
     authenticated: usize,
@@ -62,9 +107,9 @@ impl Authenticator {
     const ACCEPT_CONTEXT: &'static [u8] = b"iroh-auth-accept";
     const OPEN_CONTEXT: &'static [u8] = b"iroh-auth-open";
 
-    pub fn new(secret: SecretSlice<u8>) -> Self {
+    pub fn new<S: IntoSecret>(secret: S) -> Self {
         Self {
-            secret,
+            secret: secret.into_secret(),
             authenticated: Arc::new(Mutex::new(BTreeSet::new())),
             watcher: Watchable::new(WatchableCounter::default()),
             endpoint: Arc::new(Mutex::new(None)),
@@ -75,7 +120,7 @@ impl Authenticator {
         if let Ok(mut guard) = self.endpoint.lock() {
             if guard.is_none() {
                 *guard = Some(endpoint.clone());
-                debug!("Authenticator endpoint set to {}", endpoint.id());
+                trace!("Authenticator endpoint set to {}", endpoint.id());
             }
         }
     }
@@ -318,125 +363,19 @@ impl EndpointHooks for Authenticator {
 
         if conn_info.alpn() == Self::ALPN {
             debug!(
-                "skipping auth for connection with alpn {:?}",
-                conn_info.alpn()
+                "skipping auth for connection with alpn {}",
+                String::from_utf8_lossy(conn_info.alpn())
             );
             return AfterHandshakeOutcome::accept();
         }
 
-        if conn_info.side() == iroh::endpoint::Side::Client {
-            debug!(
-                "initiating auth for client connection to {}",
-                conn_info.remote_id()
-            );
-            let endpoint = match self.endpoint() {
-                Ok(ep) => ep,
-                Err(_) => {
-                    warn!("authenticator endpoint not set");
-                    return AfterHandshakeOutcome::Reject {
-                        error_code: VarInt::from_u32(403),
-                        reason:
-                            b"Authenticator endpoint not set: missing authenticator.start(endpoint)"
-                                .to_vec(),
-                    };
-                }
-            };
-            spawn({
-                let auth = self.clone();
-                let conn_info = conn_info.clone();
-
-                async move {
-                    debug!(
-                        "background: connecting to {} for auth",
-                        conn_info.remote_id()
-                    );
-
-                    match endpoint.connect(conn_info.remote_id(), Self::ALPN).await {
-                        Ok(conn) => {
-                            debug!(
-                                "background: connected to {}, performing auth",
-                                conn_info.remote_id()
-                            );
-                            if let Err(err) = auth.auth_open(conn).await {
-                                auth.add_blocked().ok();
-                                warn!(
-                                    "background: authentication failed for {}: {}",
-                                    conn_info.remote_id(),
-                                    err
-                                );
-                            } else {
-                                debug!(
-                                    "background: authentication successful for {}",
-                                    conn_info.remote_id()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!("background: failed to open connection for authentication to {}: {}", conn_info.remote_id(), e);
-                        }
-                    };
-                }
-            });
-        }
-
-        AfterHandshakeOutcome::accept()
-    }
-}
-
-pub trait AuthProtocolExt: ProtocolHandler + Sized {
-    fn with_auth(self, auth: Authenticator) -> AuthedHandler<Self> {
-        AuthedHandler::new(self, auth)
-    }
-}
-impl<T: ProtocolHandler> AuthProtocolExt for T {}
-
-#[derive(Debug, Clone)]
-pub struct AuthedHandler<P> {
-    inner: P,
-    auth: Authenticator,
-}
-
-impl<P> AuthedHandler<P> {
-    pub fn new(inner: P, auth: Authenticator) -> Self {
-        Self { inner, auth }
-    }
-
-    pub fn inner(&self) -> &P {
-        &self.inner
-    }
-
-    pub fn inner_mut(&mut self) -> &mut P {
-        &mut self.inner
-    }
-}
-
-impl<P> Deref for AuthedHandler<P> {
-    type Target = P;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<P> DerefMut for AuthedHandler<P> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl<P: ProtocolHandler> ProtocolHandler for AuthedHandler<P> {
-    async fn accept(&self, conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let remote_id = conn.remote_id();
-        let counter = self.auth.watcher.get();
-
-        if self.auth.is_authenticated(&remote_id) {
-            return self.inner.accept(conn).await;
-        }
+        let remote_id = conn_info.remote_id();
+        let counter = self.watcher.get();
 
         let wait_for_auth = async {
-            let mut stream = self.auth.watcher.watch().stream();
+            let mut stream = self.watcher.watch().stream();
             while let Some(next_counter) = stream.next().await {
-                if next_counter != counter && self.auth.is_authenticated(&remote_id) {
+                if next_counter != counter && self.is_authenticated(&remote_id) {
                     return Ok(()) as Result<(), AuthenticatorError>;
                 }
             }
@@ -446,17 +385,77 @@ impl<P: ProtocolHandler> ProtocolHandler for AuthedHandler<P> {
         };
 
         match timeout(Duration::from_secs(10), wait_for_auth).await {
-            Ok(_) => self.inner.accept(conn).await,
+            Ok(_) => AfterHandshakeOutcome::accept(),
             Err(_) => {
-                conn.close(
-                    iroh::endpoint::VarInt::from_u32(401),
-                    b"Authentication timed out",
-                );
-                Err(iroh::protocol::AcceptError::from_err(
-                    AuthenticatorError::AcceptFailed("Authentication timed out".to_string()),
-                ))
+                warn!("authentication timed out for {}", remote_id);
+                AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(401),
+                    reason: b"Authentication timed out".to_vec(),
+                }
             }
         }
+    }
+
+    async fn before_connect<'a>(
+        &'a self,
+        remote_addr: &'a iroh::EndpointAddr,
+        alpn: &'a [u8],
+    ) -> iroh::endpoint::BeforeConnectOutcome {
+        if self.is_authenticated(&remote_addr.id) {
+            debug!("already authenticated: {}", remote_addr.id);
+            return iroh::endpoint::BeforeConnectOutcome::Accept;
+        }
+
+        if alpn == Self::ALPN {
+            debug!(
+                "skipping auth for connection to {} with alpn {:?}",
+                remote_addr.id, alpn
+            );
+            return iroh::endpoint::BeforeConnectOutcome::Accept;
+        }
+
+        debug!(
+            "initiating auth for client connection with alpn {} to {}",
+            String::from_utf8_lossy(alpn),
+            remote_addr.id
+        );
+        let endpoint = match self.endpoint() {
+            Ok(ep) => ep,
+            Err(_) => {
+                warn!("authenticator endpoint not set");
+                return iroh::endpoint::BeforeConnectOutcome::Reject;
+            }
+        };
+        spawn({
+            let auth = self.clone();
+            let remote_id = remote_addr.id;
+
+            async move {
+                debug!("background: connecting to {} for auth", remote_id);
+
+                match endpoint.connect(remote_id, Self::ALPN).await {
+                    Ok(conn) => {
+                        debug!("background: connected to {}, performing auth", remote_id);
+                        if let Err(err) = auth.auth_open(conn).await {
+                            auth.add_blocked().ok();
+                            warn!(
+                                "background: authentication failed for {}: {}",
+                                remote_id, err
+                            );
+                        } else {
+                            debug!("background: authentication successful for {}", remote_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "background: failed to open connection for authentication to {}: {}",
+                            remote_id, e
+                        );
+                    }
+                };
+            }
+        });
+        iroh::endpoint::BeforeConnectOutcome::Accept
     }
 }
 
@@ -516,8 +515,6 @@ mod tests {
         secret_a: &'static [u8],
         secret_b: &'static [u8],
     ) -> Result<bool, String> {
-        let secret_a = SecretSlice::new(Box::from(secret_a));
-        let secret_b = SecretSlice::new(Box::from(secret_b));
 
         let auth_a = Authenticator::new(secret_a);
         let endpoint_a = iroh::Endpoint::builder()
@@ -526,7 +523,7 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         auth_a.set_endpoint(&endpoint_a);
-        let dummy_a = DummyProtocol.with_auth(auth_a.clone());
+        let dummy_a = DummyProtocol;
 
         let auth_b = Authenticator::new(secret_b);
         let endpoint_b = iroh::Endpoint::builder()
@@ -535,7 +532,7 @@ mod tests {
             .await
             .map_err(|e| e.to_string())?;
         auth_b.set_endpoint(&endpoint_b);
-        let dummy_b = DummyProtocol.with_auth(auth_b.clone());
+        let dummy_b = DummyProtocol;
 
         let router_a = iroh::protocol::Router::builder(endpoint_a.clone())
             .accept(Authenticator::ALPN, auth_a.clone())
@@ -547,10 +544,16 @@ mod tests {
             .accept(b"/dummy/1", dummy_b)
             .spawn();
 
-        let _conn = endpoint_a
-            .connect(endpoint_b.addr(), b"/dummy/1")
-            .await
-            .map_err(|e| e.to_string())?;
+        spawn({
+            let endpoint_a = endpoint_a.clone();
+            let endpoint_b = endpoint_b.clone();
+            async move {
+                endpoint_a
+                    .connect(endpoint_b.addr(), b"/dummy/1")
+                    .await
+                    .ok();
+            }
+        });
 
         let wait_loop = async {
             use n0_future::StreamExt;
@@ -584,5 +587,43 @@ mod tests {
         router_b.shutdown().await.ok();
 
         Ok(auth_a.is_authenticated(&endpoint_b.id()) && auth_b.is_authenticated(&endpoint_a.id()))
+    }
+
+    #[test]
+    fn test_into_secret_impls() {
+        use secrecy::ExposeSecret;
+
+        let expected_bytes = b"my-secret-key";
+
+        // &str
+        let secret = "my-secret-key".into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+
+        // String
+        let secret = String::from("my-secret-key").into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+        // Vec<u8>
+        let secret = b"my-secret-key".to_vec().into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+
+        // &[u8]
+        let bytes: &[u8] = b"my-secret-key";
+        let secret = bytes.into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+
+        // &[u8; N]
+        let bytes: &[u8; 13] = b"my-secret-key";
+        let secret = bytes.into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+
+        // Box<[u8]>
+        let bytes: Box<[u8]> = Box::new(*b"my-secret-key");
+        let secret = bytes.into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
+
+        // SecretSlice<u8>
+        let ps = SecretSlice::new(Box::new(*b"my-secret-key"));
+        let secret = ps.into_secret();
+        assert_eq!(secret.expose_secret(), expected_bytes);
     }
 }

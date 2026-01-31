@@ -4,11 +4,10 @@ async fn main() -> Result<(), String> {
     {
         use iroh::PublicKey;
         use iroh::{protocol::Router, Endpoint};
-        use iroh_auth::{self, AuthProtocolExt, Authenticator};
+        use iroh_auth::{self, Authenticator};
 
         use iroh_gossip::{net::Gossip, TopicId};
 
-        use secrecy::SecretSlice;
         use sha2::Digest;
 
         tracing_subscriber::fmt()
@@ -22,20 +21,22 @@ async fn main() -> Result<(), String> {
             vec![]
         };
 
-        let network_secret = SecretSlice::new(Box::new(*b"my-secure-network-secret-12345"));
-        let auth = Authenticator::new(network_secret);
+        // #1 Create Authenticator
+        let auth = Authenticator::new("my-secure-network-secret-12345");
         let endpoint = Endpoint::builder()
+            // #2 Add auth hooks
             .hooks(auth.clone())
             .bind()
             .await
             .map_err(|e| e.to_string())?;
+
+        // #3 Pass endpoint to the Authenticator for establishing auth connections
         auth.set_endpoint(&endpoint);
 
-        let gossip = Gossip::builder()
-            .spawn(endpoint.clone())
-            .with_auth(auth.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let router = Router::builder(endpoint)
+            // #4 Add Authenticator to the router
             .accept(Authenticator::ALPN, auth.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
