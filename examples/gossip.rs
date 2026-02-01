@@ -37,7 +37,7 @@ async fn main() -> Result<(), String> {
 
         let router = Router::builder(endpoint)
             // #4 Add Authenticator to the router
-            .accept(Authenticator::ALPN, auth.clone())
+            .accept(iroh_auth::ALPN, auth.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 

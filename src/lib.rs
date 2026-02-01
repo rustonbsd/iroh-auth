@@ -103,8 +103,10 @@ pub struct Authenticator {
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
 }
 
+pub const ALPN: &[u8] = b"/iroh/auth/0.1";
+
 impl Authenticator {
-    pub const ALPN: &'static [u8] = b"/iroh/auth/0.1";
+    pub const ALPN: &'static [u8] = ALPN;
     const ACCEPT_CONTEXT: &'static [u8] = b"iroh-auth-accept";
     const OPEN_CONTEXT: &'static [u8] = b"iroh-auth-open";
 
@@ -144,7 +146,7 @@ impl Authenticator {
             .ok_or(AuthenticatorError::EndpointNotSet)
     }
 
-    pub fn is_authenticated(&self, id: &PublicKey) -> bool {
+    fn is_authenticated(&self, id: &PublicKey) -> bool {
         self.authenticated
             .lock()
             .map(|set| set.contains(id))
@@ -184,7 +186,7 @@ impl Authenticator {
     /// Accept an incoming connection and perform SPAKE2 authentication.
     /// On success, adds the remote ID to the authenticated set.
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
-    pub async fn auth_accept(&self, conn: Connection) -> Result<(), AuthenticatorError> {
+    async fn auth_accept(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
         debug!("accepting auth connection from {}", remote_id);
         let (mut send, mut recv) = conn.accept_bi().await.map_err(|err| {
@@ -254,7 +256,7 @@ impl Authenticator {
     /// Open an outgoing connection and perform SPAKE2 authentication.
     /// On success, adds the remote ID to the authenticated set.
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
-    pub async fn auth_open(&self, conn: Connection) -> Result<(), AuthenticatorError> {
+    async fn auth_open(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
         debug!("opening auth connection to {}", remote_id);
         let (mut send, mut recv) = conn.open_bi().await.map_err(|err| {

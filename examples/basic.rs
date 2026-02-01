@@ -31,7 +31,7 @@ async fn main() -> Result<(), String> {
 
     // 4. Register the auth protocol handler
     let router = Router::builder(endpoint)
-        .accept(Authenticator::ALPN, auth.clone())
+        .accept(iroh_auth::ALPN, auth.clone())
 
         // Register your actual application protocols here
         .accept(b"/my-app/1.0", MyProtocolHandler)
