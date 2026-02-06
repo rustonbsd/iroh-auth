@@ -4,13 +4,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::{trace, debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use hkdf::Hkdf;
 use iroh::{
     endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, VarInt},
     protocol::ProtocolHandler,
-    Endpoint, PublicKey, Watcher,
+    Endpoint, EndpointId, PublicKey, Watcher,
 };
 use n0_future::{task::spawn, time::timeout, StreamExt};
 use secrecy::{ExposeSecret, SecretSlice};
@@ -24,6 +24,8 @@ pub enum AuthenticatorError {
     AddFailed,
     AcceptFailed(String),
     OpenFailed(String),
+    AcceptFailedAndBlock(String, EndpointId),
+    OpenFailedAndBlock(String, EndpointId),
     EndpointNotSet,
 }
 
@@ -37,6 +39,12 @@ impl std::fmt::Display for AuthenticatorError {
                 f,
                 "Authenticator endpoint not set: missing authenticator.start(endpoint)"
             ),
+            AuthenticatorError::AcceptFailedAndBlock(msg, id) => {
+                write!(f, "Blocked endpoint ID: {}: {}", msg, id)
+            }
+            AuthenticatorError::OpenFailedAndBlock(msg, id) => {
+                write!(f, "Blocked endpoint ID: {}: {}", msg, id)
+            }
         }
     }
 }
@@ -104,6 +112,7 @@ pub struct Authenticator {
 }
 
 pub const ALPN: &[u8] = b"/iroh/auth/0.1";
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Authenticator {
     pub const ALPN: &'static [u8] = ALPN;
@@ -213,7 +222,7 @@ impl Authenticator {
 
         let shared_secret = spake.finish(&token_a).map_err(|err| {
             error!("SPAKE2 invalid: {}", err);
-            AuthenticatorError::AcceptFailed(format!("SPAKE2 invalid: {}", err))
+            AuthenticatorError::AcceptFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
 
         let hk = Hkdf::<Sha512>::new(None, shared_secret.as_slice());
@@ -242,8 +251,9 @@ impl Authenticator {
 
         if !bool::from(remote_open_key.ct_eq(&open_key)) {
             error!("remote open_key mismatch");
-            return Err(AuthenticatorError::AcceptFailed(
+            return Err(AuthenticatorError::AcceptFailedAndBlock(
                 "Remote open_key mismatch".to_string(),
+                remote_id,
             ));
         }
 
@@ -261,7 +271,7 @@ impl Authenticator {
         debug!("opening auth connection to {}", remote_id);
         let (mut send, mut recv) = conn.open_bi().await.map_err(|err| {
             error!("open bidirectional stream failed: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Open bidirectional stream failed: {}", err))
+            AuthenticatorError::OpenFailed(format!("Open bidirectional stream failed: {}", err))
         })?;
 
         let (spake, token_a) = Spake2::<Ed25519Group>::start_a(
@@ -272,18 +282,18 @@ impl Authenticator {
 
         send.write_all(&token_a).await.map_err(|err| {
             error!("failed to write token_a: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Failed to write token_a: {}", err))
+            AuthenticatorError::OpenFailed(format!("Failed to write token_a: {}", err))
         })?;
 
         let mut token_b = [0u8; 33];
         recv.read_exact(&mut token_b).await.map_err(|err| {
             error!("failed to read token_b: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Failed to read token_b: {}", err))
+            AuthenticatorError::OpenFailed(format!("Failed to read token_b: {}", err))
         })?;
 
         let shared_secret = spake.finish(&token_b).map_err(|err| {
             error!("SPAKE2 invalid: {}", err);
-            AuthenticatorError::AcceptFailed(format!("SPAKE2 invalid: {}", err))
+            AuthenticatorError::OpenFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
 
         let hk = Hkdf::<Sha512>::new(None, shared_secret.as_slice());
@@ -292,12 +302,12 @@ impl Authenticator {
         hk.expand(Self::ACCEPT_CONTEXT, &mut accept_key)
             .map_err(|err| {
                 error!("failed to expand accept_key: {}", err);
-                AuthenticatorError::AcceptFailed(format!("Failed to expand accept_key: {}", err))
+                AuthenticatorError::OpenFailed(format!("Failed to expand accept_key: {}", err))
             })?;
         hk.expand(Self::OPEN_CONTEXT, &mut open_key)
             .map_err(|err| {
                 error!("failed to expand open_key: {}", err);
-                AuthenticatorError::AcceptFailed(format!("Failed to expand open_key: {}", err))
+                AuthenticatorError::OpenFailed(format!("Failed to expand open_key: {}", err))
             })?;
 
         let mut remote_accept_key = [0u8; 64];
@@ -305,26 +315,32 @@ impl Authenticator {
             .await
             .map_err(|err| {
                 error!("failed to read remote_accept_key: {}", err);
-                AuthenticatorError::AcceptFailed(format!(
-                    "Failed to read remote_accept_key: {}",
-                    err
-                ))
+                AuthenticatorError::OpenFailed(format!("Failed to read remote_accept_key: {}", err))
             })?;
 
         if !bool::from(remote_accept_key.ct_eq(&accept_key)) {
             error!("remote accept_key mismatch");
-            return Err(AuthenticatorError::AcceptFailed(
+
+            // Writing a random dummy open_key back to finishing the stream but not give away
+            // that the accept_key was correct to avoid leaking information to an attacker about valid accept_keys
+            // (probably not needed but better safe than sorry ^^)
+            send.write_all(&rand::random::<[u8; 64]>()).await.ok();
+            send.finish().ok();
+            conn.closed().await;
+
+            return Err(AuthenticatorError::OpenFailedAndBlock(
                 "Remote accept_key mismatch".to_string(),
+                remote_id,
             ));
         }
 
         send.write_all(&open_key).await.map_err(|err| {
             error!("failed to write open_key: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Failed to write open_key: {}", err))
+            AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
         send.finish().map_err(|err| {
             error!("failed to finish stream: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Failed to finish stream: {}", err))
+            AuthenticatorError::OpenFailed(format!("Failed to finish stream: {}", err))
         })?;
 
         conn.closed().await;
@@ -341,15 +357,25 @@ impl ProtocolHandler for Authenticator {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        if let Err(err) = self
-            .auth_accept(connection)
-            .await
-            .map_err(|err| iroh::protocol::AcceptError::from_err(err))
-        {
-            self.add_blocked().ok();
-            Err(err)
-        } else {
-            Ok(())
+        match timeout(AUTH_TIMEOUT, self.auth_accept(connection)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => match &err {
+                AuthenticatorError::AcceptFailedAndBlock(msg, public_key) => {
+                    warn!("authentication failed and blocking {}: {}", public_key, msg);
+                    self.add_blocked().ok();
+                    Err(iroh::protocol::AcceptError::from_err(err))
+                }
+                _ => {
+                    warn!("authentication failed: {}", err);
+                    Err(iroh::protocol::AcceptError::from_err(err))
+                }
+            },
+            Err(_) => {
+                warn!("authentication failed: timed out");
+                Err(iroh::protocol::AcceptError::from_err(
+                    AuthenticatorError::AcceptFailed("Authentication timed out".into()),
+                ))
+            }
         }
     }
 }
@@ -387,7 +413,7 @@ impl EndpointHooks for Authenticator {
             ))
         };
 
-        match timeout(Duration::from_secs(10), wait_for_auth).await {
+        match timeout(AUTH_TIMEOUT, wait_for_auth).await {
             Ok(_) => AfterHandshakeOutcome::accept(),
             Err(_) => {
                 warn!("authentication timed out for {}", remote_id);
@@ -435,27 +461,51 @@ impl EndpointHooks for Authenticator {
 
             async move {
                 debug!("background: connecting to {} for auth", remote_id);
-
-                match endpoint.connect(remote_id, Self::ALPN).await {
-                    Ok(conn) => {
-                        debug!("background: connected to {}, performing auth", remote_id);
-                        if let Err(err) = auth.auth_open(conn).await {
-                            auth.add_blocked().ok();
-                            warn!(
-                                "background: authentication failed for {}: {}",
-                                remote_id, err
-                            );
-                        } else {
-                            debug!("background: authentication successful for {}", remote_id);
+                let start = std::time::Instant::now();
+                while start.elapsed() < AUTH_TIMEOUT {
+                    match endpoint.connect(remote_id, Self::ALPN).await {
+                        Ok(conn) => {
+                            debug!("background: connected to {}, performing auth", remote_id);
+                            match timeout(AUTH_TIMEOUT, auth.auth_open(conn)).await {
+                                Ok(Ok(())) => {
+                                    debug!(
+                                        "background: authentication successful for {}",
+                                        remote_id
+                                    );
+                                    return;
+                                }
+                                Ok(Err(err)) => match &err {
+                                    AuthenticatorError::OpenFailedAndBlock(msg, public_key) => {
+                                        warn!(
+                                            "authentication failed and blocking {}: {}",
+                                            public_key, msg
+                                        );
+                                        auth.add_blocked().ok();
+                                        return;
+                                    }
+                                    _ => {
+                                        warn!("authentication failed for {}: {}", remote_id, err);
+                                    }
+                                },
+                                Err(_) => {
+                                    warn!(
+                                        "background: authentication timed out for {}, retrying...",
+                                        remote_id
+                                    );
+                                }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "background: failed to open connection for authentication to {}: {}",
-                            remote_id, e
-                        );
-                    }
-                };
+                        Err(e) => {
+                            warn!(
+                                "background: failed to open connection for authentication to {}: {}, retrying...",
+                                remote_id, e
+                            );
+                        }
+                    };
+                    
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                warn!("background: authentication timed out for {}", remote_id);
             }
         });
         iroh::endpoint::BeforeConnectOutcome::Accept
@@ -518,7 +568,6 @@ mod tests {
         secret_a: &'static [u8],
         secret_b: &'static [u8],
     ) -> Result<bool, String> {
-
         let auth_a = Authenticator::new(secret_a);
         let endpoint_a = iroh::Endpoint::builder()
             .hooks(auth_a.clone())
@@ -564,6 +613,10 @@ mod tests {
             let wait_a = async {
                 let mut stream = auth_a.watcher.watch().stream();
                 while let Some(counter) = stream.next().await {
+                    debug!(
+                        "auth_a watcher: authenticated={}, blocked={}",
+                        counter.authenticated, counter.blocked
+                    );
                     if counter.authenticated >= 1 || counter.blocked >= 1 {
                         break;
                     }
@@ -572,6 +625,10 @@ mod tests {
             let wait_b = async {
                 let mut stream = auth_b.watcher.watch().stream();
                 while let Some(counter) = stream.next().await {
+                    debug!(
+                        "auth_b watcher: authenticated={}, blocked={}",
+                        counter.authenticated, counter.blocked
+                    );
                     if counter.authenticated >= 1 || counter.blocked >= 1 {
                         break;
                     }
@@ -580,7 +637,7 @@ mod tests {
             tokio::join!(wait_a, wait_b);
         };
 
-        if timeout(Duration::from_secs(20), wait_loop).await.is_err() {
+        if timeout(AUTH_TIMEOUT * 2, wait_loop).await.is_err() {
             router_a.shutdown().await.ok();
             router_b.shutdown().await.ok();
             return Err("Authentication did not complete in time".to_string());
