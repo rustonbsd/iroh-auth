@@ -112,7 +112,7 @@ pub struct Authenticator {
 }
 
 pub const ALPN: &[u8] = b"/iroh/auth/0.1";
-pub const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Authenticator {
     pub const ALPN: &'static [u8] = ALPN;
