@@ -197,9 +197,9 @@ impl Authenticator {
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
     async fn auth_accept(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
-        debug!("accepting auth connection from {}", remote_id);
+        debug!("[auth_accept] accepting auth connection from {}", remote_id);
         let (mut send, mut recv) = conn.accept_bi().await.map_err(|err| {
-            error!("accept bidirectional stream failed: {}", err);
+            error!("[auth_accept] accept bidirectional stream failed: {}", err);
             AuthenticatorError::AcceptFailed(format!("Accept bidirectional stream failed: {}", err))
         })?;
 
@@ -211,17 +211,17 @@ impl Authenticator {
 
         let mut token_a = [0u8; 33];
         recv.read_exact(&mut token_a).await.map_err(|err| {
-            error!("failed to read token_a: {}", err);
+            error!("[auth_accept] failed to read token_a: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to read token_a: {}", err))
         })?;
 
         send.write_all(&token_b).await.map_err(|err| {
-            error!("failed to write token_b: {}", err);
+            error!("[auth_accept] failed to write token_b: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to write token_b: {}", err))
         })?;
 
         let shared_secret = spake.finish(&token_a).map_err(|err| {
-            error!("SPAKE2 invalid: {}", err);
+            error!("[auth_accept] SPAKE2 invalid: {}", err);
             AuthenticatorError::AcceptFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
 
@@ -230,27 +230,27 @@ impl Authenticator {
         let mut open_key = [0u8; 64];
         hk.expand(Self::ACCEPT_CONTEXT, &mut accept_key)
             .map_err(|err| {
-                error!("failed to expand accept_key: {}", err);
+                error!("[auth_accept] failed to expand accept_key: {}", err);
                 AuthenticatorError::AcceptFailed(format!("Failed to expand accept_key: {}", err))
             })?;
         hk.expand(Self::OPEN_CONTEXT, &mut open_key)
             .map_err(|err| {
-                error!("failed to expand open_key: {}", err);
+                error!("[auth_accept] failed to expand open_key: {}", err);
                 AuthenticatorError::AcceptFailed(format!("Failed to expand open_key: {}", err))
             })?;
 
         send.write_all(&accept_key).await.map_err(|err| {
-            error!("failed to write accept_key: {}", err);
+            error!("[auth_accept] failed to write accept_key: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to write accept_key: {}", err))
         })?;
         let mut remote_open_key = [0u8; 64];
         recv.read_exact(&mut remote_open_key).await.map_err(|err| {
-            error!("failed to read remote_open_key: {}", err);
+            error!("[auth_accept] failed to read remote_open_key: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
 
         if !bool::from(remote_open_key.ct_eq(&open_key)) {
-            error!("remote open_key mismatch");
+            error!("[auth_accept] remote open_key mismatch");
             return Err(AuthenticatorError::AcceptFailedAndBlock(
                 "Remote open_key mismatch".to_string(),
                 remote_id,
@@ -258,7 +258,7 @@ impl Authenticator {
         }
 
         self.add_authenticated(conn.remote_id())?;
-        info!("authenticated connection from {}", remote_id);
+        info!("[auth_accept] authenticated connection from {}", remote_id);
 
         Ok(())
     }
@@ -268,9 +268,9 @@ impl Authenticator {
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
     async fn auth_open(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
-        debug!("opening auth connection to {}", remote_id);
+        debug!("[auth_open] opening auth connection to {}", remote_id);
         let (mut send, mut recv) = conn.open_bi().await.map_err(|err| {
-            error!("open bidirectional stream failed: {}", err);
+            error!("[auth_open] open bidirectional stream failed: {}", err);
             AuthenticatorError::OpenFailed(format!("Open bidirectional stream failed: {}", err))
         })?;
 
@@ -281,18 +281,18 @@ impl Authenticator {
         );
 
         send.write_all(&token_a).await.map_err(|err| {
-            error!("failed to write token_a: {}", err);
+            error!("[auth_open] failed to write token_a: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write token_a: {}", err))
         })?;
 
         let mut token_b = [0u8; 33];
         recv.read_exact(&mut token_b).await.map_err(|err| {
-            error!("failed to read token_b: {}", err);
+            error!("[auth_open] failed to read token_b: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to read token_b: {}", err))
         })?;
 
         let shared_secret = spake.finish(&token_b).map_err(|err| {
-            error!("SPAKE2 invalid: {}", err);
+            error!("[auth_open] SPAKE2 invalid: {}", err);
             AuthenticatorError::OpenFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
 
@@ -301,12 +301,12 @@ impl Authenticator {
         let mut open_key = [0u8; 64];
         hk.expand(Self::ACCEPT_CONTEXT, &mut accept_key)
             .map_err(|err| {
-                error!("failed to expand accept_key: {}", err);
+                error!("[auth_open] failed to expand accept_key: {}", err);
                 AuthenticatorError::OpenFailed(format!("Failed to expand accept_key: {}", err))
             })?;
         hk.expand(Self::OPEN_CONTEXT, &mut open_key)
             .map_err(|err| {
-                error!("failed to expand open_key: {}", err);
+                error!("[auth_open] failed to expand open_key: {}", err);
                 AuthenticatorError::OpenFailed(format!("Failed to expand open_key: {}", err))
             })?;
 
@@ -314,12 +314,12 @@ impl Authenticator {
         recv.read_exact(&mut remote_accept_key)
             .await
             .map_err(|err| {
-                error!("failed to read remote_accept_key: {}", err);
+                error!("[auth_open] failed to read remote_accept_key: {}", err);
                 AuthenticatorError::OpenFailed(format!("Failed to read remote_accept_key: {}", err))
             })?;
 
         if !bool::from(remote_accept_key.ct_eq(&accept_key)) {
-            error!("remote accept_key mismatch");
+            error!("[auth_open] remote accept_key mismatch");
 
             // Writing a random dummy open_key back to finishing the stream but not give away
             // that the accept_key was correct to avoid leaking information to an attacker about valid accept_keys
@@ -335,18 +335,18 @@ impl Authenticator {
         }
 
         send.write_all(&open_key).await.map_err(|err| {
-            error!("failed to write open_key: {}", err);
+            error!("[auth_open] failed to write open_key: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
         send.finish().map_err(|err| {
-            error!("failed to finish stream: {}", err);
+            error!("[auth_open] failed to finish stream: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to finish stream: {}", err))
         })?;
 
         conn.closed().await;
 
         self.add_authenticated(conn.remote_id())?;
-        info!("authenticated connection to {}", remote_id);
+        info!("[auth_open] authenticated connection to {}", remote_id);
 
         Ok(())
     }
@@ -361,17 +361,17 @@ impl ProtocolHandler for Authenticator {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => match &err {
                 AuthenticatorError::AcceptFailedAndBlock(msg, public_key) => {
-                    warn!("authentication failed and blocking {}: {}", public_key, msg);
+                    warn!("[accept] authentication failed and blocking {}: {}", public_key, msg);
                     self.add_blocked().ok();
                     Err(iroh::protocol::AcceptError::from_err(err))
                 }
                 _ => {
-                    warn!("authentication failed: {}", err);
+                    warn!("[accept] authentication failed: {}", err);
                     Err(iroh::protocol::AcceptError::from_err(err))
                 }
             },
             Err(_) => {
-                warn!("authentication failed: timed out");
+                warn!("[accept] authentication failed: timed out");
                 Err(iroh::protocol::AcceptError::from_err(
                     AuthenticatorError::AcceptFailed("Authentication timed out".into()),
                 ))
@@ -386,13 +386,13 @@ impl EndpointHooks for Authenticator {
         conn_info: &'a iroh::endpoint::ConnectionInfo,
     ) -> iroh::endpoint::AfterHandshakeOutcome {
         if self.is_authenticated(&conn_info.remote_id()) {
-            debug!("already authenticated: {}", conn_info.remote_id());
+            debug!("[after_handshake] already authenticated: {}", conn_info.remote_id());
             return AfterHandshakeOutcome::accept();
         }
 
         if conn_info.alpn() == Self::ALPN {
             debug!(
-                "skipping auth for connection with alpn {}",
+                "[after_handshake] skipping auth for connection with alpn {}",
                 String::from_utf8_lossy(conn_info.alpn())
             );
             return AfterHandshakeOutcome::accept();
@@ -416,7 +416,7 @@ impl EndpointHooks for Authenticator {
         match timeout(AUTH_TIMEOUT, wait_for_auth).await {
             Ok(_) => AfterHandshakeOutcome::accept(),
             Err(_) => {
-                warn!("authentication timed out for {}", remote_id);
+                warn!("[after_handshake] authentication timed out for {}", remote_id);
                 AfterHandshakeOutcome::Reject {
                     error_code: VarInt::from_u32(401),
                     reason: b"Authentication timed out".to_vec(),
@@ -431,27 +431,27 @@ impl EndpointHooks for Authenticator {
         alpn: &'a [u8],
     ) -> iroh::endpoint::BeforeConnectOutcome {
         if self.is_authenticated(&remote_addr.id) {
-            debug!("already authenticated: {}", remote_addr.id);
+            debug!("[before_connect] already authenticated: {}", remote_addr.id);
             return iroh::endpoint::BeforeConnectOutcome::Accept;
         }
 
         if alpn == Self::ALPN {
             debug!(
-                "skipping auth for connection to {} with alpn {:?}",
+                "[before_connect] skipping auth for connection to {} with alpn {:?}",
                 remote_addr.id, alpn
             );
             return iroh::endpoint::BeforeConnectOutcome::Accept;
         }
 
         debug!(
-            "initiating auth for client connection with alpn {} to {}",
+            "[before_connect] initiating auth for client connection with alpn {} to {}",
             String::from_utf8_lossy(alpn),
             remote_addr.id
         );
         let endpoint = match self.endpoint() {
             Ok(ep) => ep,
             Err(_) => {
-                warn!("authenticator endpoint not set");
+                warn!("[before_connect] authenticator endpoint not set");
                 return iroh::endpoint::BeforeConnectOutcome::Reject;
             }
         };
@@ -460,16 +460,16 @@ impl EndpointHooks for Authenticator {
             let remote_id = remote_addr.id;
 
             async move {
-                debug!("background: connecting to {} for auth", remote_id);
+                debug!("[before_connect] background: connecting to {} for auth", remote_id);
                 let start = std::time::Instant::now();
                 while start.elapsed() < AUTH_TIMEOUT {
                     match endpoint.connect(remote_id, Self::ALPN).await {
                         Ok(conn) => {
-                            debug!("background: connected to {}, performing auth", remote_id);
+                            debug!("[before_connect] background: connected to {}, performing auth", remote_id);
                             match timeout(AUTH_TIMEOUT, auth.auth_open(conn)).await {
                                 Ok(Ok(())) => {
                                     debug!(
-                                        "background: authentication successful for {}",
+                                        "[before_connect] background: authentication successful for {}",
                                         remote_id
                                     );
                                     return;
@@ -477,19 +477,19 @@ impl EndpointHooks for Authenticator {
                                 Ok(Err(err)) => match &err {
                                     AuthenticatorError::OpenFailedAndBlock(msg, public_key) => {
                                         warn!(
-                                            "authentication failed and blocking {}: {}",
+                                            "[before_connect] authentication failed and blocking {}: {}",
                                             public_key, msg
                                         );
                                         auth.add_blocked().ok();
                                         return;
                                     }
                                     _ => {
-                                        warn!("authentication failed for {}: {}", remote_id, err);
+                                        warn!("[before_connect] authentication failed for {}: {}", remote_id, err);
                                     }
                                 },
                                 Err(_) => {
                                     warn!(
-                                        "background: authentication timed out for {}, retrying...",
+                                        "[before_connect] background: authentication timed out for {}, retrying...",
                                         remote_id
                                     );
                                 }
@@ -497,7 +497,7 @@ impl EndpointHooks for Authenticator {
                         }
                         Err(e) => {
                             warn!(
-                                "background: failed to open connection for authentication to {}: {}, retrying...",
+                                "[before_connect] background: failed to open connection for authentication to {}: {}, retrying...",
                                 remote_id, e
                             );
                         }
@@ -505,7 +505,7 @@ impl EndpointHooks for Authenticator {
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                warn!("background: authentication timed out for {}", remote_id);
+                warn!("[before_connect] background: authentication timed out for {}", remote_id);
             }
         });
         iroh::endpoint::BeforeConnectOutcome::Accept
