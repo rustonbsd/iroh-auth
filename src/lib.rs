@@ -192,6 +192,26 @@ impl Authenticator {
             .unwrap_or_default()
     }
 
+    async fn end_of_auth(&self, send: &mut iroh::endpoint::SendStream, open: bool) -> Result<(), AuthenticatorError> {
+        send.finish().map_err(|err| {
+            error!("[end_of_auth] failed to finish stream: {}", err);
+            if open {
+                AuthenticatorError::OpenFailed(format!("Failed to finish stream: {}", err))
+            } else {
+                AuthenticatorError::AcceptFailed(format!("Failed to finish stream: {}", err))
+            }
+        })?;
+        send.stopped().await.map_err(|err| {
+            error!("[end_of_auth] failed to wait for stream stopped: {}", err);
+            if open {
+                AuthenticatorError::OpenFailed(format!("Failed to wait for stream stopped: {}", err))
+            } else {
+                AuthenticatorError::AcceptFailed(format!("Failed to wait for stream stopped: {}", err))
+            }
+        })?;
+        Ok(())
+    }
+
     /// Accept an incoming connection and perform SPAKE2 authentication.
     /// On success, adds the remote ID to the authenticated set.
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
@@ -248,6 +268,8 @@ impl Authenticator {
             error!("[auth_accept] failed to read remote_open_key: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
+
+        self.end_of_auth(&mut send, false).await?;
 
         if !bool::from(remote_open_key.ct_eq(&open_key)) {
             error!("[auth_accept] remote open_key mismatch");
@@ -325,8 +347,7 @@ impl Authenticator {
             // that the accept_key was correct to avoid leaking information to an attacker about valid accept_keys
             // (probably not needed but better safe than sorry ^^)
             send.write_all(&rand::random::<[u8; 64]>()).await.ok();
-            send.finish().ok();
-            conn.closed().await;
+            self.end_of_auth(&mut send, true).await?;
 
             return Err(AuthenticatorError::OpenFailedAndBlock(
                 "Remote accept_key mismatch".to_string(),
@@ -338,12 +359,7 @@ impl Authenticator {
             error!("[auth_open] failed to write open_key: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
-        send.finish().map_err(|err| {
-            error!("[auth_open] failed to finish stream: {}", err);
-            AuthenticatorError::OpenFailed(format!("Failed to finish stream: {}", err))
-        })?;
-
-        conn.closed().await;
+        self.end_of_auth(&mut send, true).await?;
 
         self.add_authenticated(conn.remote_id())?;
         info!("[auth_open] authenticated connection to {}", remote_id);
