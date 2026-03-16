@@ -20,7 +20,7 @@ async fn main() -> Result<(), String> {
     let auth = Authenticator::new("my-super-secret-password");
 
     // 2. Build the endpoint with the auth hooks
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
         .hooks(auth.clone())
         .bind()
         .await.map_err(|e| e.to_string())?;

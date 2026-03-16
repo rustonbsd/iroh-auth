@@ -585,7 +585,7 @@ mod tests {
         secret_b: &'static [u8],
     ) -> Result<bool, String> {
         let auth_a = Authenticator::new(secret_a);
-        let endpoint_a = iroh::Endpoint::builder()
+        let endpoint_a = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .hooks(auth_a.clone())
             .bind()
             .await
@@ -594,7 +594,7 @@ mod tests {
         let dummy_a = DummyProtocol;
 
         let auth_b = Authenticator::new(secret_b);
-        let endpoint_b = iroh::Endpoint::builder()
+        let endpoint_b = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .hooks(auth_b.clone())
             .bind()
             .await
