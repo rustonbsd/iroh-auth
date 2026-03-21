@@ -112,7 +112,7 @@ pub struct Authenticator {
 }
 
 pub const ALPN: &[u8] = b"/iroh/auth/0.1";
-pub const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Authenticator {
     pub const ALPN: &'static [u8] = ALPN;
@@ -192,7 +192,11 @@ impl Authenticator {
             .unwrap_or_default()
     }
 
-    async fn end_of_auth(&self, send: &mut iroh::endpoint::SendStream, open: bool) -> Result<(), AuthenticatorError> {
+    async fn end_of_auth(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        open: bool,
+    ) -> Result<(), AuthenticatorError> {
         send.finish().map_err(|err| {
             error!("[end_of_auth] failed to finish stream: {}", err);
             if open {
@@ -201,14 +205,21 @@ impl Authenticator {
                 AuthenticatorError::AcceptFailed(format!("Failed to finish stream: {}", err))
             }
         })?;
-        send.stopped().await.map_err(|err| {
-            error!("[end_of_auth] failed to wait for stream stopped: {}", err);
+        if let Err(err) = send.stopped().await.map_err(|err| {
             if open {
-                AuthenticatorError::OpenFailed(format!("Failed to wait for stream stopped: {}", err))
+                AuthenticatorError::OpenFailed(format!(
+                    "Failed to wait for stream stopped: {}",
+                    err
+                ))
             } else {
-                AuthenticatorError::AcceptFailed(format!("Failed to wait for stream stopped: {}", err))
+                AuthenticatorError::AcceptFailed(format!(
+                    "Failed to wait for stream stopped: {}",
+                    err
+                ))
             }
-        })?;
+        }) {
+            warn!("[end_of_auth] {}", err);
+        }
         Ok(())
     }
 
@@ -218,10 +229,19 @@ impl Authenticator {
     async fn auth_accept(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
         debug!("[auth_accept] accepting auth connection from {}", remote_id);
-        let (mut send, mut recv) = conn.accept_bi().await.map_err(|err| {
-            error!("[auth_accept] accept bidirectional stream failed: {}", err);
-            AuthenticatorError::AcceptFailed(format!("Accept bidirectional stream failed: {}", err))
-        })?;
+        let (mut send, mut recv) = timeout(Duration::from_secs(3), conn.accept_bi())
+            .await
+            .map_err(|_| {
+                error!("[auth_accept] accept bidirectional stream timed out");
+                AuthenticatorError::AcceptFailed(format!("Accept bidirectional stream timed out"))
+            })?
+            .map_err(|err| {
+                error!("[auth_accept] accept bidirectional stream failed: {}", err);
+                AuthenticatorError::AcceptFailed(format!(
+                    "Accept bidirectional stream failed: {}",
+                    err
+                ))
+            })?;
 
         let (spake, token_b) = Spake2::<Ed25519Group>::start_b(
             &Password::new(self.secret.expose_secret()),
@@ -291,10 +311,16 @@ impl Authenticator {
     async fn auth_open(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
         debug!("[auth_open] opening auth connection to {}", remote_id);
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|err| {
-            error!("[auth_open] open bidirectional stream failed: {}", err);
-            AuthenticatorError::OpenFailed(format!("Open bidirectional stream failed: {}", err))
-        })?;
+        let (mut send, mut recv) = timeout(Duration::from_secs(3), conn.open_bi())
+            .await
+            .map_err(|_| {
+                error!("[auth_open] open bidirectional stream timed out");
+                AuthenticatorError::OpenFailed(format!("Open bidirectional stream timed out"))
+            })?
+            .map_err(|err| {
+                error!("[auth_open] open bidirectional stream failed: {}", err);
+                AuthenticatorError::OpenFailed(format!("Open bidirectional stream failed: {}", err))
+            })?;
 
         let (spake, token_a) = Spake2::<Ed25519Group>::start_a(
             &Password::new(self.secret.expose_secret()),
@@ -377,7 +403,10 @@ impl ProtocolHandler for Authenticator {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => match &err {
                 AuthenticatorError::AcceptFailedAndBlock(msg, public_key) => {
-                    warn!("[accept] authentication failed and blocking {}: {}", public_key, msg);
+                    warn!(
+                        "[accept] authentication failed and blocking {}: {}",
+                        public_key, msg
+                    );
                     self.add_blocked().ok();
                     Err(iroh::protocol::AcceptError::from_err(err))
                 }
@@ -402,7 +431,10 @@ impl EndpointHooks for Authenticator {
         conn_info: &'a iroh::endpoint::ConnectionInfo,
     ) -> iroh::endpoint::AfterHandshakeOutcome {
         if self.is_authenticated(&conn_info.remote_id()) {
-            debug!("[after_handshake] already authenticated: {}", conn_info.remote_id());
+            debug!(
+                "[after_handshake] already authenticated: {}",
+                conn_info.remote_id()
+            );
             return AfterHandshakeOutcome::accept();
         }
 
@@ -432,7 +464,10 @@ impl EndpointHooks for Authenticator {
         match timeout(AUTH_TIMEOUT, wait_for_auth).await {
             Ok(_) => AfterHandshakeOutcome::accept(),
             Err(_) => {
-                warn!("[after_handshake] authentication timed out for {}", remote_id);
+                warn!(
+                    "[after_handshake] authentication timed out for {}",
+                    remote_id
+                );
                 AfterHandshakeOutcome::Reject {
                     error_code: VarInt::from_u32(401),
                     reason: b"Authentication timed out".to_vec(),
@@ -476,12 +511,18 @@ impl EndpointHooks for Authenticator {
             let remote_id = remote_addr.id;
 
             async move {
-                debug!("[before_connect] background: connecting to {} for auth", remote_id);
+                debug!(
+                    "[before_connect] background: connecting to {} for auth",
+                    remote_id
+                );
                 let start = std::time::Instant::now();
                 while start.elapsed() < AUTH_TIMEOUT {
                     match endpoint.connect(remote_id, Self::ALPN).await {
                         Ok(conn) => {
-                            debug!("[before_connect] background: connected to {}, performing auth", remote_id);
+                            debug!(
+                                "[before_connect] background: connected to {}, performing auth",
+                                remote_id
+                            );
                             match timeout(AUTH_TIMEOUT, auth.auth_open(conn)).await {
                                 Ok(Ok(())) => {
                                     debug!(
@@ -500,7 +541,10 @@ impl EndpointHooks for Authenticator {
                                         return;
                                     }
                                     _ => {
-                                        warn!("[before_connect] authentication failed for {}: {}", remote_id, err);
+                                        warn!(
+                                            "[before_connect] authentication failed for {}: {}",
+                                            remote_id, err
+                                        );
                                     }
                                 },
                                 Err(_) => {
@@ -518,10 +562,13 @@ impl EndpointHooks for Authenticator {
                             );
                         }
                     };
-                    
+
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                warn!("[before_connect] background: authentication timed out for {}", remote_id);
+                warn!(
+                    "[before_connect] background: authentication timed out for {}",
+                    remote_id
+                );
             }
         });
         iroh::endpoint::BeforeConnectOutcome::Accept
