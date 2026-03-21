@@ -78,7 +78,7 @@ sequenceDiagram
 
     Client->>Server: 1. App Connection Request
     activate Server
-    Note right of Server: ✋ Paused (Waiting for Auth)
+    Note right of Server: Paused (Waiting for Auth)
 
     rect rgb(225, 255, 225)
         Note over Client, Server: 2. Authentication (Background)
@@ -87,11 +87,11 @@ sequenceDiagram
 
     alt Success
         Server->>Server: Verify Secret (OK)
-        Note right of Server: ✅ Resumed
+        Note right of Server: Resumed
         Server-->>Client: 3. App Connection Accepted
     else Failure
         Server->>Server: Verify Secret (Fail)
-        Note right of Server: ❌ Rejected
+        Note right of Server: Rejected
         Server-->>Client: 3. Connection Closed
     end
     deactivate Server
