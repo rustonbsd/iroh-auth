@@ -192,23 +192,19 @@ impl Authenticator {
             .unwrap_or_default()
     }
 
-    async fn end_of_auth(&self, send: &mut iroh::endpoint::SendStream, open: bool) -> Result<(), AuthenticatorError> {
-        send.finish().map_err(|err| {
-            error!("[end_of_auth] failed to finish stream: {}", err);
-            if open {
-                AuthenticatorError::OpenFailed(format!("Failed to finish stream: {}", err))
-            } else {
-                AuthenticatorError::AcceptFailed(format!("Failed to finish stream: {}", err))
-            }
-        })?;
-        send.stopped().await.map_err(|err| {
-            error!("[end_of_auth] failed to wait for stream stopped: {}", err);
-            if open {
-                AuthenticatorError::OpenFailed(format!("Failed to wait for stream stopped: {}", err))
-            } else {
-                AuthenticatorError::AcceptFailed(format!("Failed to wait for stream stopped: {}", err))
-            }
-        })?;
+    /// Best-effort stream finalization.
+    ///
+    /// All SPAKE2 tokens and HKDF-derived keys are already written and read
+    /// (and therefore ACKed at the QUIC layer) before callers reach this
+    /// function — the stream FIN is cosmetic. Awaiting `stopped()` races with
+    /// connection teardown: whichever side completes auth first drops its
+    /// `Connection`, which yanks the peer's in-flight `stopped().await` with
+    /// a spurious `connection lost` and previously caused one-sided
+    /// authentication (the opener succeeded, the acceptor bailed here before
+    /// reaching `add_authenticated`).
+    async fn end_of_auth(&self, send: &mut iroh::endpoint::SendStream, _open: bool) -> Result<(), AuthenticatorError> {
+        let _ = send.finish();
+        let _ = send.stopped().await;
         Ok(())
     }
 
@@ -269,17 +265,22 @@ impl Authenticator {
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
 
-        self.end_of_auth(&mut send, false).await?;
-
         if !bool::from(remote_open_key.ct_eq(&open_key)) {
             error!("[auth_accept] remote open_key mismatch");
+            let _ = self.end_of_auth(&mut send, false).await;
             return Err(AuthenticatorError::AcceptFailedAndBlock(
                 "Remote open_key mismatch".to_string(),
                 remote_id,
             ));
         }
 
+        // Commit the authenticated peer to the set *before* tearing down the
+        // auth stream. `end_of_auth` can observe `connection lost` if the
+        // opener finishes first and drops its `Connection`; we must not let
+        // that spurious teardown error hide a successful authentication from
+        // the `after_handshake` watcher.
         self.add_authenticated(conn.remote_id())?;
+        let _ = self.end_of_auth(&mut send, false).await;
         info!("[auth_accept] authenticated connection from {}", remote_id);
 
         Ok(())
@@ -347,7 +348,7 @@ impl Authenticator {
             // that the accept_key was correct to avoid leaking information to an attacker about valid accept_keys
             // (probably not needed but better safe than sorry ^^)
             send.write_all(&rand::random::<[u8; 64]>()).await.ok();
-            self.end_of_auth(&mut send, true).await?;
+            let _ = self.end_of_auth(&mut send, true).await;
 
             return Err(AuthenticatorError::OpenFailedAndBlock(
                 "Remote accept_key mismatch".to_string(),
@@ -359,9 +360,10 @@ impl Authenticator {
             error!("[auth_open] failed to write open_key: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
-        self.end_of_auth(&mut send, true).await?;
 
+        // Commit before stream teardown — see auth_accept for rationale.
         self.add_authenticated(conn.remote_id())?;
+        let _ = self.end_of_auth(&mut send, true).await;
         info!("[auth_open] authenticated connection to {}", remote_id);
 
         Ok(())
