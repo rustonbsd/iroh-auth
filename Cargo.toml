@@ -1,6 +1,6 @@
 [package]
 name = "iroh-auth"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["rustonbsd <rustonbsd@mailfence.com>"]
 description = "Authentication middleware for iroh"
