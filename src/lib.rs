@@ -1,6 +1,6 @@
 use n0_watcher::Watchable;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{hash_map::Entry, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,7 +13,7 @@ use iroh::{
     protocol::ProtocolHandler,
     Endpoint, EndpointId, PublicKey, Watcher,
 };
-use n0_future::{task::spawn, time::timeout, StreamExt};
+use n0_future::{time::timeout, StreamExt};
 use secrecy::{ExposeSecret, SecretSlice};
 use sha2::Sha512;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -36,6 +36,12 @@ pub enum TransmissionError {
     ReadFailed(String),
     SendTimeout,
     ReadTimeout,
+}
+
+#[derive(Debug)]
+pub enum InFlightError {
+    LockPoisoned(String),
+    PromotionNotAllowed(String),
 }
 
 impl std::fmt::Display for AuthenticatorError {
@@ -69,6 +75,16 @@ impl std::fmt::Display for TransmissionError {
     }
 }
 
+impl std::fmt::Display for InFlightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InFlightError::LockPoisoned(msg) => write!(f, "In-flight lock poisoned: {}", msg),
+            InFlightError::PromotionNotAllowed(msg) => write!(f, "Promotion not allowed: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for InFlightError {}
 impl std::error::Error for TransmissionError {}
 impl std::error::Error for AuthenticatorError {}
 
@@ -118,63 +134,89 @@ impl IntoSecret for Box<[u8]> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WatchableCounter {
-    authenticated: usize,
-    blocked: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct Authenticator {
     secret: SecretSlice<u8>,
-    authenticated: Arc<Mutex<BTreeSet<PublicKey>>>,
-    watcher: Watchable<WatchableCounter>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
-    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableEndpoint>>>,
+    auth_state: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthState {
+    Unauthenticated,
+    InFlight,
+    Authenticated,
+    Blocked,
+}
+
+impl std::fmt::Display for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthState::Unauthenticated => write!(f, "Unauthenticated"),
+            AuthState::InFlight => write!(f, "InFlight"),
+            AuthState::Authenticated => write!(f, "Authenticated"),
+            AuthState::Blocked => write!(f, "Blocked"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterResponse {
+    InFlightRegistered,   // auth after this
+    AlreadyInFlight, // another auth was running while we called this, only check is_authenticaded, don't auth again
+    AlreadyAuthenticated, // we are already authenticaded, same as AlreadyInFlight => only check is_authenticaded, don't auth again
+    AlreadyBlocked,       // we are blocked, DO NOT AUTH AGAIN, just reject
 }
 
 #[derive(Debug, Clone)]
-struct WatchableEndpoint {
-    inner: Watchable<Option<PublicKey>>,
+struct WatchableRemote {
+    id: PublicKey,
+    inner: Watchable<AuthState>,
 }
 
-impl WatchableEndpoint {
-    pub fn new(endpoint_id: Option<PublicKey>) -> Self {
+impl WatchableRemote {
+    /// inner is AuthState::Unauthenticated by default
+    fn new(id: PublicKey) -> Self {
         Self {
-            inner: Watchable::new(endpoint_id),
+            id,
+            inner: Watchable::new(AuthState::Unauthenticated),
         }
     }
 
-    pub fn watcher(&self) -> Watchable<Option<PublicKey>> {
+    pub fn watcher(&self) -> Watchable<AuthState> {
         self.inner.clone()
     }
 
-    pub fn get(&self) -> Option<PublicKey> {
+    pub fn id(&self) -> &PublicKey {
+        &self.id
+    }
+
+    pub fn state(&self) -> AuthState {
         self.inner.get()
     }
 
-    pub fn set(&self, endpoint_id: Option<PublicKey>) {
-        self.inner.set(endpoint_id).ok();
+    pub fn set_state(&self, state: AuthState) {
+        self.inner.set(state).ok();
     }
 }
 
-impl PartialEq for WatchableEndpoint {
+impl PartialEq for WatchableRemote {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.get() == other.inner.get()
+        self.state() == other.state()
     }
 }
 
-impl Eq for WatchableEndpoint {}
+impl Eq for WatchableRemote {}
 
-impl PartialEq<PublicKey> for WatchableEndpoint {
+impl PartialEq<PublicKey> for WatchableRemote {
     fn eq(&self, other: &PublicKey) -> bool {
-        self.inner.get().as_ref() == Some(other)
+        self.id() == other
     }
 }
 
-impl std::hash::Hash for WatchableEndpoint {
+impl std::hash::Hash for WatchableRemote {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.inner.get().hash(state);
+        self.id().hash(state);
     }
 }
 
@@ -190,10 +232,8 @@ impl Authenticator {
     pub fn new<S: IntoSecret>(secret: S) -> Self {
         Self {
             secret: secret.into_secret(),
-            authenticated: Arc::new(Mutex::new(BTreeSet::new())),
-            watcher: Watchable::new(WatchableCounter::default()),
             endpoint: Arc::new(Mutex::new(None)),
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            auth_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -225,81 +265,59 @@ impl Authenticator {
     }
 
     fn is_authenticated(&self, id: &PublicKey) -> bool {
-        self.authenticated
+        self.auth_state
             .lock()
-            .map(|set| set.contains(id))
+            .map(|in_flight| {
+                if let Some(watchable) = in_flight.get(id) {
+                    if watchable.state() == AuthState::Authenticated {
+                        return true;
+                    }
+                }
+                false
+            })
             .unwrap_or(false)
     }
 
-    fn add_authenticated(&self, id: PublicKey) -> Result<(), AuthenticatorError> {
-        self.authenticated
+    #[cfg(test)]
+    fn list_authenticated(&self) -> Vec<PublicKey> {
+        self.auth_state
             .lock()
-            .map_err(|_| AuthenticatorError::AddFailed)?
-            .insert(id);
-        let mut counter = self.watcher.get();
-        counter.authenticated += 1;
-        self.watcher
-            .set(counter)
-            .map_err(|_| AuthenticatorError::AddFailed)?;
-        Ok(())
-    }
-
-    fn add_blocked(&self) -> Result<(), AuthenticatorError> {
-        let mut counter = self.watcher.get();
-        counter.blocked += 1;
-        self.watcher
-            .set(counter)
-            .map_err(|_| AuthenticatorError::AddFailed)?;
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn list_authenticated(&self) -> Vec<PublicKey> {
-        self.authenticated
-            .lock()
-            .map(|set| set.iter().cloned().collect())
+            .map(|in_flight| {
+                in_flight
+                    .iter()
+                    .filter_map(|(id, watchable)| {
+                        if watchable.state() == AuthState::Authenticated {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    async fn register_in_flight(&self, endpoint_id: PublicKey) -> bool {
-        let watcher = if let Ok(mut in_flight) = self.in_flight.lock() {
-            let watcher = in_flight
-                .entry(endpoint_id)
-                .or_insert_with(|| WatchableEndpoint::new(None));
-
-            if watcher.get().is_none() {
-                watcher.set(Some(endpoint_id));
-                return true;
-            }
-            watcher.clone()
-        } else {
-            warn!("failed to acquire in_flight lock");
-            return false;
-        };
-
-        debug!("already in flight, waiting for watcher in_flight updates");
-        timeout(AUTH_TIMEOUT, async {
-            let mut stream = watcher.watcher().watch().stream();
-            while let Some(pub_key) = stream.next().await {
-                if pub_key.is_none() {
-                    return;
-                }
-            }
-        })
-        .await
-        .ok();
-        false
+    #[cfg(test)]
+    fn list_blocked(&self) -> Vec<PublicKey> {
+        self.auth_state
+            .lock()
+            .map(|in_flight| {
+                in_flight
+                    .iter()
+                    .filter_map(|(id, watchable)| {
+                        if watchable.state() == AuthState::Blocked {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
+}
 
-    fn release_in_flight(&self, endpoint_id: PublicKey) {
-        if let Ok(mut in_flight) = self.in_flight.lock() {
-            in_flight
-                .entry(endpoint_id)
-                .or_insert_with(|| WatchableEndpoint::new(None))
-                .set(None);
-        }
-    }
-
+impl Authenticator {
     async fn end_of_auth(
         &self,
         send: &mut iroh::endpoint::SendStream,
@@ -314,19 +332,35 @@ impl Authenticator {
                 AuthenticatorError::AcceptFailed(format!("Failed to finish stream: {}", err))
             }
         })?;
-        if let Err(err) = recv.read_to_end(usize::MAX).await.map_err(|err| {
-            if open {
-                AuthenticatorError::OpenFailed(format!(
-                    "Failed to wait for stream stopped: {}",
-                    err
-                ))
-            } else {
-                AuthenticatorError::AcceptFailed(format!(
-                    "Failed to wait for stream stopped: {}",
-                    err
-                ))
-            }
-        }) {
+
+        const MAX_READ_SIZE: usize = 1024;
+        if let Err(err) = tokio::time::timeout(AUTH_TIMEOUT, recv.read_to_end(MAX_READ_SIZE))
+            .await
+            .map_err(|_| {
+                if open {
+                    AuthenticatorError::OpenFailed(
+                        "Failed to wait for stream stopped: timeout".to_string(),
+                    )
+                } else {
+                    AuthenticatorError::AcceptFailed(
+                        "Failed to wait for stream stopped: timeout".to_string(),
+                    )
+                }
+            })
+            .map_err(|err| {
+                if open {
+                    AuthenticatorError::OpenFailed(format!(
+                        "Failed to wait for stream stopped: {}",
+                        err
+                    ))
+                } else {
+                    AuthenticatorError::AcceptFailed(format!(
+                        "Failed to wait for stream stopped: {}",
+                        err
+                    ))
+                }
+            })
+        {
             warn!("[end_of_auth] {}", err);
         }
         Ok(())
@@ -408,7 +442,6 @@ impl Authenticator {
             ));
         }
 
-        self.add_authenticated(conn.remote_id())?;
         info!("[auth_accept] authenticated connection from {}", remote_id);
 
         Ok(())
@@ -496,7 +529,6 @@ impl Authenticator {
         })?;
         self.end_of_auth(&mut send, &mut recv, true).await?;
 
-        self.add_authenticated(conn.remote_id())?;
         info!("[auth_open] authenticated connection to {}", remote_id);
 
         Ok(())
@@ -510,30 +542,45 @@ impl ProtocolHandler for Authenticator {
     ) -> Result<(), iroh::protocol::AcceptError> {
         let remote_id = connection.remote_id();
         let res = match timeout(AUTH_TIMEOUT, self.auth_accept(connection)).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                release_in_flight(self.auth_state.clone(), remote_id, AuthState::Authenticated)
+                    .ok();
+                Ok(())
+            }
             Ok(Err(err)) => match &err {
                 AuthenticatorError::AcceptFailedAndBlock(msg, public_key) => {
                     warn!(
                         "[accept] authentication failed and blocking {}: {}",
                         public_key, msg
                     );
-                    self.add_blocked().ok();
+                    release_in_flight(self.auth_state.clone(), remote_id, AuthState::Blocked).ok();
                     Err(iroh::protocol::AcceptError::from_err(err))
                 }
                 _ => {
                     warn!("[accept] authentication failed: {}", err);
+                    release_in_flight(
+                        self.auth_state.clone(),
+                        remote_id,
+                        AuthState::Unauthenticated,
+                    )
+                    .ok();
                     Err(iroh::protocol::AcceptError::from_err(err))
                 }
             },
             Err(_) => {
                 warn!("[accept] authentication failed: timed out");
+                release_in_flight(
+                    self.auth_state.clone(),
+                    remote_id,
+                    AuthState::Unauthenticated,
+                )
+                .ok();
                 Err(iroh::protocol::AcceptError::from_err(
                     AuthenticatorError::AcceptFailed("Authentication timed out".into()),
                 ))
             }
         };
 
-        self.release_in_flight(remote_id);
         res
     }
 }
@@ -551,33 +598,81 @@ impl EndpointHooks for Authenticator {
             return AfterHandshakeOutcome::accept();
         }
 
+        let endpoint_id = conn_info.remote_id();
         if conn_info.alpn() == Self::ALPN {
             debug!(
-                "[after_handshake] skipping auth for connection with alpn {}",
+                "[after_handshake] accepting auth connection: {}",
                 String::from_utf8_lossy(conn_info.alpn())
             );
             return AfterHandshakeOutcome::accept();
         }
 
-        let endpoint_id = conn_info.remote_id();
-        let in_flight_watcher = match self.in_flight.lock() {
-            Ok(mut in_flight) => in_flight
-                .entry(endpoint_id)
-                .or_insert_with(|| WatchableEndpoint::new(None))
-                .watcher()
-                .clone(),
-            Err(_) => {
-                return AfterHandshakeOutcome::Reject {
-                    error_code: VarInt::from_u32(500),
-                    reason: b"Internal error".to_vec(),
+        // wait for authentication to complete
+        let in_flight_watcher =
+            if let Some(watchable) = get_auth_state(self.auth_state.clone(), endpoint_id) {
+                match watchable.state() {
+                    AuthState::Unauthenticated => {
+                        debug!(
+                            "[after_handshake] no in-flight auth for {}, rejecting connection",
+                            endpoint_id
+                        );
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(401),
+                            reason: b"No authentication in progress".to_vec(),
+                        };
+                    }
+                    AuthState::InFlight => {
+                        debug!(
+                            "[after_handshake] waiting for in-flight auth for {}",
+                            endpoint_id
+                        );
+                        watchable.watcher()
+                    }
+                    AuthState::Authenticated => {
+                        // we try is_authenticated, if not we clear to None and reject
+                        if self.is_authenticated(&conn_info.remote_id()) {
+                            debug!(
+                                "[after_handshake] already authenticated: {}",
+                                conn_info.remote_id()
+                            );
+                            return AfterHandshakeOutcome::accept();
+                        }
+
+                        warn!("expected {endpoint_id} to be authenticated, resetting");
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(500),
+                            reason: b"in_flight status indicates already authenticated".to_vec(),
+                        };
+                    }
+                    AuthState::Blocked => {
+                        debug!(
+                            "[after_handshake] endpoint {} is blocked, rejecting connection",
+                            endpoint_id
+                        );
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(403),
+                            reason: b"Endpoint is blocked".to_vec(),
+                        };
+                    }
                 }
-            }
-        };
+            } else {
+                debug!(
+                    "[after_handshake] no in-flight auth for {}, rejecting connection",
+                    endpoint_id
+                );
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(401),
+                    reason: b"No authentication in progress".to_vec(),
+                };
+            };
 
         let wait_for_auth = async {
             let mut stream = in_flight_watcher.watch().stream();
             while let Some(in_flight) = stream.next().await {
-                if in_flight.is_none() || self.is_authenticated(&endpoint_id) {
+                if matches!(
+                    in_flight,
+                    AuthState::Unauthenticated | AuthState::Authenticated | AuthState::Blocked
+                ) {
                     return;
                 }
             }
@@ -620,40 +715,65 @@ impl EndpointHooks for Authenticator {
 
         if alpn == Self::ALPN {
             debug!(
-                "[before_connect] skipping auth for connection to {} with alpn {}",
-                remote_id,
-                String::from_utf8_lossy(alpn)
+                "[before_connect] initiating auth for client connection with alpn {} to {}",
+                String::from_utf8_lossy(alpn),
+                remote_id
             );
             return iroh::endpoint::BeforeConnectOutcome::Accept;
         }
 
-        debug!(
-            "[before_connect] initiating auth for client connection with alpn {} to {}",
-            String::from_utf8_lossy(alpn),
-            remote_id
-        );
-        let endpoint = match self.endpoint() {
-            Ok(ep) => ep,
-            Err(_) => {
-                warn!("[before_connect] authenticator endpoint not set");
-                return iroh::endpoint::BeforeConnectOutcome::Reject;
-            }
-        };
-        if !self.register_in_flight(remote_id).await {
-            if self.is_authenticated(&remote_id) {
+        match register_in_flight(self.auth_state.clone(), remote_id) {
+            Ok(RegisterResponse::InFlightRegistered) => {
                 debug!(
+                    "[before_connect] registered in-flight auth for {}, performing auth",
+                    remote_id
+                );
+
+                // We spawn the authentication worker in a new task
+                // before_connect returns directly with BeforeConnectOutcome::Accept
+                let endpoint = match self.endpoint() {
+                    Ok(ep) => ep,
+                    Err(_) => {
+                        warn!("[before_connect] authenticator endpoint not set");
+                        return iroh::endpoint::BeforeConnectOutcome::Reject;
+                    }
+                };
+                self.spawn_auth_worker(remote_id, endpoint);
+            }
+            Ok(RegisterResponse::AlreadyInFlight) | Ok(RegisterResponse::AlreadyAuthenticated) => {
+                if self.is_authenticated(&remote_id) {
+                    debug!(
                     "[before_connect] already authenticated (in flight), accepting connection to {}",
                     remote_id
                 );
-                return iroh::endpoint::BeforeConnectOutcome::Accept;
+                    return iroh::endpoint::BeforeConnectOutcome::Accept;
+                }
             }
-            warn!("[before_connect] failed to acquire in_flight lock");
-            return iroh::endpoint::BeforeConnectOutcome::Reject;
+            Ok(RegisterResponse::AlreadyBlocked) => {
+                debug!(
+                    "[before_connect] endpoint {} is blocked, rejecting connection",
+                    remote_id
+                );
+                return iroh::endpoint::BeforeConnectOutcome::Reject;
+            }
+            Err(err) => {
+                warn!(
+                    "[before_connect] failed to register in-flight auth for {}: {}",
+                    remote_id, err
+                );
+                return iroh::endpoint::BeforeConnectOutcome::Reject;
+            }
         }
-        spawn({
+        iroh::endpoint::BeforeConnectOutcome::Accept
+    }
+}
+
+impl Authenticator {
+    fn spawn_auth_worker(&self, remote_id: EndpointId, endpoint: Endpoint) {
+        tokio::spawn({
             let auth = self.clone();
             let remote_id = remote_id.clone();
-            let in_flight_ref = self.in_flight.clone();
+            let in_flight_ref = self.auth_state.clone();
             let start_time = Instant::now();
             async move {
                 while start_time.elapsed() < AUTH_TIMEOUT {
@@ -673,12 +793,13 @@ impl EndpointHooks for Authenticator {
                                         "[before_connect] background: authentication successful for {}",
                                         remote_id
                                     );
-                                    if let Ok(mut in_flight) = in_flight_ref.lock() {
-                                        in_flight
-                                            .entry(remote_id)
-                                            .or_insert_with(|| WatchableEndpoint::new(None))
-                                            .set(None);
-                                    }
+
+                                    release_in_flight(
+                                        in_flight_ref.clone(),
+                                        remote_id,
+                                        AuthState::Authenticated,
+                                    )
+                                    .ok();
                                     return;
                                 }
                                 Ok(Err(err)) => match &err {
@@ -687,14 +808,12 @@ impl EndpointHooks for Authenticator {
                                             "[before_connect] authentication failed and blocking {}: {}",
                                             public_key, msg
                                         );
-                                        auth.add_blocked().ok();
-
-                                        if let Ok(mut in_flight) = in_flight_ref.lock() {
-                                            in_flight
-                                                .entry(remote_id)
-                                                .or_insert_with(|| WatchableEndpoint::new(None))
-                                                .set(None);
-                                        }
+                                        release_in_flight(
+                                            in_flight_ref.clone(),
+                                            remote_id,
+                                            AuthState::Blocked,
+                                        )
+                                        .ok();
                                         return;
                                     }
                                     _ => {
@@ -721,20 +840,98 @@ impl EndpointHooks for Authenticator {
                     };
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                if let Ok(mut in_flight) = in_flight_ref.lock() {
-                    in_flight
-                        .entry(remote_id)
-                        .or_insert_with(|| WatchableEndpoint::new(None))
-                        .set(None);
-                }
+
                 warn!(
                     "[before_connect] background: authentication timed out for {}",
                     remote_id
                 );
+
+                // Timeout no more retries, clean up in-flight state
+                release_in_flight(in_flight_ref.clone(), remote_id, AuthState::Unauthenticated)
+                    .ok();
             }
         });
-        iroh::endpoint::BeforeConnectOutcome::Accept
     }
+}
+
+fn register_in_flight(
+    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+) -> Result<RegisterResponse, InFlightError> {
+    if let Ok(mut in_flight) = in_flight.lock() {
+        match in_flight.entry(endpoint_id) {
+            Entry::Occupied(entry) => match entry.get().state() {
+                AuthState::Unauthenticated => {
+                    entry.get().set_state(AuthState::InFlight);
+                    Ok(RegisterResponse::InFlightRegistered)
+                }
+                AuthState::Authenticated => Ok(RegisterResponse::AlreadyAuthenticated),
+                AuthState::InFlight => Ok(RegisterResponse::AlreadyInFlight),
+                AuthState::Blocked => Ok(RegisterResponse::AlreadyBlocked),
+            },
+            Entry::Vacant(entry) => {
+                let watchable = WatchableRemote::new(endpoint_id);
+                watchable.set_state(AuthState::InFlight);
+                entry.insert(watchable);
+                Ok(RegisterResponse::InFlightRegistered)
+            }
+        }
+    } else {
+        warn!("failed to acquire in_flight lock");
+        Err(InFlightError::LockPoisoned(
+            "register_in_flight".to_string(),
+        ))
+    }
+}
+
+fn release_in_flight(
+    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+    target_state: AuthState,
+) -> Result<(), InFlightError> {
+    if target_state == AuthState::InFlight {
+        return Err(InFlightError::PromotionNotAllowed(
+            "cannot release by promoting to InFlight".to_string(),
+        ));
+    }
+    if let Ok(mut in_flight) = in_flight.lock() {
+        match in_flight.entry(endpoint_id) {
+            Entry::Occupied(entry) => {
+                let c_state = entry.get().state();
+                match c_state {
+                    AuthState::InFlight => {
+                        entry.get().set_state(target_state);
+                        Ok(())
+                    }
+                    _ => Err(InFlightError::PromotionNotAllowed(format!(
+                        "only promote to {} from {} not from {}",
+                        target_state,
+                        AuthState::InFlight,
+                        c_state
+                    ))),
+                }
+            }
+            Entry::Vacant(entry) => {
+                debug!("no entry detected, this means we are the accepting side of a auth request, accept target_state unconditionally");
+                let watchable = WatchableRemote::new(endpoint_id);
+                watchable.set_state(target_state);
+                entry.insert(watchable);
+                Ok(())
+            }
+        }
+    } else {
+        Err(InFlightError::LockPoisoned("release_in_flight".to_string()))
+    }
+}
+
+fn get_auth_state(
+    auth_state: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+) -> Option<WatchableRemote> {
+    if let Ok(in_flight) = auth_state.lock() {
+        return in_flight.get(&endpoint_id).cloned();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -742,7 +939,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use iroh::{RelayMap, Watcher};
+    use iroh::RelayMap;
+    use tokio::time;
 
     #[test]
     fn test_token_different() {
@@ -845,7 +1043,7 @@ mod tests {
             .accept(Authenticator::ALPN, auth_b.clone())
             .spawn();
 
-        spawn({
+        tokio::spawn({
             let endpoint_a = endpoint_a.clone();
             let endpoint_b = endpoint_b.clone();
             async move {
@@ -857,30 +1055,14 @@ mod tests {
         });
 
         let wait_loop = async {
-            use n0_future::StreamExt;
-
             let wait_a = async {
-                let mut stream = auth_a.watcher.watch().stream();
-                while let Some(counter) = stream.next().await {
-                    debug!(
-                        "auth_a watcher: authenticated={}, blocked={}",
-                        counter.authenticated, counter.blocked
-                    );
-                    if counter.authenticated >= 1 || counter.blocked >= 1 {
-                        break;
-                    }
+                while auth_a.list_authenticated().is_empty() && auth_a.list_blocked().is_empty() {
+                    time::sleep(Duration::from_millis(100)).await;
                 }
             };
             let wait_b = async {
-                let mut stream = auth_b.watcher.watch().stream();
-                while let Some(counter) = stream.next().await {
-                    debug!(
-                        "auth_b watcher: authenticated={}, blocked={}",
-                        counter.authenticated, counter.blocked
-                    );
-                    if counter.authenticated >= 1 || counter.blocked >= 1 {
-                        break;
-                    }
+                while auth_b.list_authenticated().is_empty() && auth_b.list_blocked().is_empty() {
+                    time::sleep(Duration::from_millis(100)).await;
                 }
             };
             tokio::join!(wait_a, wait_b);
@@ -911,7 +1093,9 @@ mod tests {
         }
         let endpoint_a = endpoint_a_builder
             .clear_relay_transports()
-            .relay_mode(iroh::RelayMode::Custom(RelayMap::try_from_iter(["https://iroh-relay.rustonbsd.com"]).unwrap()))
+            .relay_mode(iroh::RelayMode::Custom(
+                RelayMap::try_from_iter(["https://iroh-relay.rustonbsd.com"]).unwrap(),
+            ))
             .hooks(auth_a.clone())
             .bind()
             .await
@@ -926,7 +1110,9 @@ mod tests {
         }
         let endpoint_b = endpoint_b_builder
             .clear_relay_transports()
-            .relay_mode(iroh::RelayMode::Custom(RelayMap::try_from_iter(["https://iroh-relay.rustonbsd.com"]).unwrap()))
+            .relay_mode(iroh::RelayMode::Custom(
+                RelayMap::try_from_iter(["https://iroh-relay.rustonbsd.com"]).unwrap(),
+            ))
             .hooks(auth_b.clone())
             .bind()
             .await
@@ -953,7 +1139,7 @@ mod tests {
 
         for i in 0..parallel_count {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            spawn({
+            tokio::spawn({
                 let endpoint_a = endpoint_a.clone();
                 let endpoint_b = endpoint_b.clone();
                 async move {
@@ -969,30 +1155,14 @@ mod tests {
         }
 
         let wait_loop = async {
-            use n0_future::StreamExt;
-
             let wait_a = async {
-                let mut stream = auth_a.watcher.watch().stream();
-                while let Some(counter) = stream.next().await {
-                    debug!(
-                        "auth_a watcher: authenticated={}, blocked={}",
-                        counter.authenticated, counter.blocked
-                    );
-                    if counter.authenticated >= 1 || counter.blocked >= 1 {
-                        break;
-                    }
+                while auth_a.list_authenticated().is_empty() && auth_a.list_blocked().is_empty() {
+                    time::sleep(Duration::from_millis(100)).await;
                 }
             };
             let wait_b = async {
-                let mut stream = auth_b.watcher.watch().stream();
-                while let Some(counter) = stream.next().await {
-                    debug!(
-                        "auth_b watcher: authenticated={}, blocked={}",
-                        counter.authenticated, counter.blocked
-                    );
-                    if counter.authenticated >= 1 || counter.blocked >= 1 {
-                        break;
-                    }
+                while auth_b.list_authenticated().is_empty() && auth_b.list_blocked().is_empty() {
+                    time::sleep(Duration::from_millis(100)).await;
                 }
             };
             tokio::join!(wait_a, wait_b);
