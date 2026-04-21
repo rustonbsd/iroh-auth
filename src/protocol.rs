@@ -1,0 +1,321 @@
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
+
+use iroh::{
+    EndpointId, PublicKey, Watcher, endpoint::{AfterHandshakeOutcome, EndpointHooks, VarInt}, protocol::ProtocolHandler
+};
+use n0_future::StreamExt;
+use tokio::{sync::Mutex, time::timeout};
+use tracing::{debug, warn};
+
+use crate::{
+    ALPN, AUTH_TIMEOUT, Authenticator, AuthenticatorError, auth::{AuthState, RegisterResponse, WatchableRemote}, error::InFlightError
+};
+
+impl ProtocolHandler for Authenticator {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let remote_id = connection.remote_id();
+        let res = match timeout(AUTH_TIMEOUT, self.auth_accept(connection)).await {
+            Ok(Ok(())) => {
+                release_in_flight(self.auth_state.clone(), remote_id, AuthState::Authenticated)
+                    .await
+                    .ok();
+                Ok(())
+            }
+            Ok(Err(err)) => match &err {
+                AuthenticatorError::AcceptFailedAndBlock(msg, public_key) => {
+                    warn!(
+                        "[accept] authentication failed and blocking {}: {}",
+                        public_key, msg
+                    );
+                    release_in_flight(self.auth_state.clone(), remote_id, AuthState::Blocked)
+                        .await
+                        .ok();
+                    Err(iroh::protocol::AcceptError::from_err(err))
+                }
+                _ => {
+                    warn!("[accept] authentication failed: {}", err);
+                    release_in_flight(
+                        self.auth_state.clone(),
+                        remote_id,
+                        AuthState::Unauthenticated,
+                    )
+                    .await
+                    .ok();
+                    Err(iroh::protocol::AcceptError::from_err(err))
+                }
+            },
+            Err(_) => {
+                warn!("[accept] authentication failed: timed out");
+                release_in_flight(
+                    self.auth_state.clone(),
+                    remote_id,
+                    AuthState::Unauthenticated,
+                )
+                .await
+                .ok();
+                Err(iroh::protocol::AcceptError::from_err(
+                    AuthenticatorError::AcceptFailed("Authentication timed out".into()),
+                ))
+            }
+        };
+
+        res
+    }
+}
+
+impl EndpointHooks for Authenticator {
+    async fn after_handshake<'a>(
+        &'a self,
+        conn_info: &'a iroh::endpoint::ConnectionInfo,
+    ) -> iroh::endpoint::AfterHandshakeOutcome {
+        if self.is_authenticated(&conn_info.remote_id()).await {
+            debug!(
+                "[after_handshake] already authenticated: {}",
+                conn_info.remote_id()
+            );
+            return AfterHandshakeOutcome::accept();
+        }
+
+        let endpoint_id = conn_info.remote_id();
+        if conn_info.alpn() == ALPN {
+            debug!(
+                "[after_handshake] accepting auth connection: {}",
+                String::from_utf8_lossy(conn_info.alpn())
+            );
+            return AfterHandshakeOutcome::accept();
+        }
+
+        // wait for authentication to complete
+        let in_flight_watcher =
+            if let Some(watchable) = get_auth_state(self.auth_state.clone(), endpoint_id).await {
+                match watchable.state() {
+                    AuthState::Unauthenticated => {
+                        debug!(
+                            "[after_handshake] no in-flight auth for {}, rejecting connection",
+                            endpoint_id
+                        );
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(401),
+                            reason: b"No authentication in progress".to_vec(),
+                        };
+                    }
+                    AuthState::InFlight => {
+                        debug!(
+                            "[after_handshake] waiting for in-flight auth for {}",
+                            endpoint_id
+                        );
+                        watchable.watcher()
+                    }
+                    AuthState::Authenticated => {
+                        // we try is_authenticated, if not we clear to None and reject
+                        if self.is_authenticated(&conn_info.remote_id()).await {
+                            debug!(
+                                "[after_handshake] already authenticated: {}",
+                                conn_info.remote_id()
+                            );
+                            return AfterHandshakeOutcome::accept();
+                        }
+
+                        warn!("expected {endpoint_id} to be authenticated, resetting");
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(500),
+                            reason: b"in_flight status indicates already authenticated".to_vec(),
+                        };
+                    }
+                    AuthState::Blocked => {
+                        debug!(
+                            "[after_handshake] endpoint {} is blocked, rejecting connection",
+                            endpoint_id
+                        );
+                        return AfterHandshakeOutcome::Reject {
+                            error_code: VarInt::from_u32(403),
+                            reason: b"Endpoint is blocked".to_vec(),
+                        };
+                    }
+                }
+            } else {
+                debug!(
+                    "[after_handshake] no in-flight auth for {}, rejecting connection",
+                    endpoint_id
+                );
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(401),
+                    reason: b"No authentication in progress".to_vec(),
+                };
+            };
+
+        let wait_for_auth = async {
+            let mut stream = in_flight_watcher.watch().stream();
+            while let Some(in_flight) = stream.next().await {
+                if matches!(
+                    in_flight,
+                    AuthState::Unauthenticated | AuthState::Authenticated | AuthState::Blocked
+                ) {
+                    return;
+                }
+            }
+        };
+
+        match timeout(AUTH_TIMEOUT, wait_for_auth).await {
+            Ok(_) => {
+                if self.is_authenticated(&endpoint_id).await {
+                    AfterHandshakeOutcome::accept()
+                } else {
+                    AfterHandshakeOutcome::Reject {
+                        error_code: VarInt::from_u32(401),
+                        reason: b"Authentication failed".to_vec(),
+                    }
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "[after_handshake] authentication timed out for {}",
+                    endpoint_id
+                );
+                AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(401),
+                    reason: b"Authentication timed out".to_vec(),
+                }
+            }
+        }
+    }
+
+    async fn before_connect<'a>(
+        &'a self,
+        remote_addr: &'a iroh::EndpointAddr,
+        alpn: &'a [u8],
+    ) -> iroh::endpoint::BeforeConnectOutcome {
+        let remote_id = remote_addr.id;
+        if self.is_authenticated(&remote_id).await {
+            debug!("[before_connect] already authenticated: {}", remote_id);
+            return iroh::endpoint::BeforeConnectOutcome::Accept;
+        }
+
+        if alpn == ALPN {
+            debug!(
+                "[before_connect] initiating auth for client connection with alpn {} to {}",
+                String::from_utf8_lossy(alpn),
+                remote_id
+            );
+            return iroh::endpoint::BeforeConnectOutcome::Accept;
+        }
+
+        match register_in_flight(self.auth_state.clone(), remote_id).await {
+            Ok(RegisterResponse::InFlightRegistered) => {
+                debug!(
+                    "[before_connect] registered in-flight auth for {}, performing auth",
+                    remote_id
+                );
+
+                // We spawn the authentication worker in a new task
+                // before_connect returns directly with BeforeConnectOutcome::Accept
+                let endpoint = match self.endpoint().await {
+                    Ok(ep) => ep,
+                    Err(_) => {
+                        warn!("[before_connect] authenticator endpoint not set");
+                        return iroh::endpoint::BeforeConnectOutcome::Reject;
+                    }
+                };
+                self.spawn_auth_worker(remote_id, endpoint).await;
+            }
+            Ok(RegisterResponse::AlreadyInFlight) | Ok(RegisterResponse::AlreadyAuthenticated) => {
+                if self.is_authenticated(&remote_id).await {
+                    debug!(
+                    "[before_connect] already authenticated (in flight), accepting connection to {}",
+                    remote_id
+                );
+                    return iroh::endpoint::BeforeConnectOutcome::Accept;
+                }
+            }
+            Ok(RegisterResponse::AlreadyBlocked) => {
+                debug!(
+                    "[before_connect] endpoint {} is blocked, rejecting connection",
+                    remote_id
+                );
+                return iroh::endpoint::BeforeConnectOutcome::Reject;
+            }
+            Err(err) => {
+                warn!(
+                    "[before_connect] failed to register in-flight auth for {}: {}",
+                    remote_id, err
+                );
+                return iroh::endpoint::BeforeConnectOutcome::Reject;
+            }
+        }
+        iroh::endpoint::BeforeConnectOutcome::Accept
+    }
+}
+
+pub(crate) async fn register_in_flight(
+    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+) -> Result<RegisterResponse, InFlightError> {
+    let mut guard = in_flight.lock().await;
+    match guard.entry(endpoint_id) {
+        Entry::Occupied(entry) => match entry.get().state() {
+            AuthState::Unauthenticated => {
+                entry.get().set_state(AuthState::InFlight);
+                Ok(RegisterResponse::InFlightRegistered)
+            }
+            AuthState::Authenticated => Ok(RegisterResponse::AlreadyAuthenticated),
+            AuthState::InFlight => Ok(RegisterResponse::AlreadyInFlight),
+            AuthState::Blocked => Ok(RegisterResponse::AlreadyBlocked),
+        },
+        Entry::Vacant(entry) => {
+            let watchable = WatchableRemote::new(endpoint_id);
+            watchable.set_state(AuthState::InFlight);
+            entry.insert(watchable);
+            Ok(RegisterResponse::InFlightRegistered)
+        }
+    }
+}
+
+pub(crate) async fn release_in_flight(
+    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+    target_state: AuthState,
+) -> Result<(), InFlightError> {
+    if target_state == AuthState::InFlight {
+        return Err(InFlightError::PromotionNotAllowed(
+            "cannot release by promoting to InFlight".to_string(),
+        ));
+    }
+    let mut guard = in_flight.lock().await;
+    match guard.entry(endpoint_id) {
+        Entry::Occupied(entry) => {
+            let c_state = entry.get().state();
+            match c_state {
+                AuthState::InFlight => {
+                    entry.get().set_state(target_state);
+                    Ok(())
+                }
+                _ => Err(InFlightError::PromotionNotAllowed(format!(
+                    "only promote to {} from {} not from {}",
+                    target_state,
+                    AuthState::InFlight,
+                    c_state
+                ))),
+            }
+        }
+        Entry::Vacant(entry) => {
+            debug!("no entry detected, this means we are the accepting side of a auth request, accept target_state unconditionally");
+            let watchable = WatchableRemote::new(endpoint_id);
+            watchable.set_state(target_state);
+            entry.insert(watchable);
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn get_auth_state(
+    auth_state: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    endpoint_id: PublicKey,
+) -> Option<WatchableRemote> {
+    auth_state.lock().await.get(&endpoint_id).cloned()
+}
