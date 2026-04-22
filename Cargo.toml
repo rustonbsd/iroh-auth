@@ -1,6 +1,6 @@
 [package]
 name = "iroh-auth"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 authors = ["rustonbsd <rustonbsd@mailfence.com>"]
 description = "Authentication middleware for iroh"
@@ -38,7 +38,7 @@ tracing-subscriber = { version = "0.3", features = [
 
 [features]
 gossip-example = ["iroh-gossip", "anyhow", "tracing-subscriber", "tokio/signal"]
-default = ["gossip-example"]
+default = []
 
 [[example]]
 name = "gossip"
