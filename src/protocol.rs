@@ -1,17 +1,19 @@
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use iroh::{
-    EndpointId, PublicKey, Watcher, endpoint::{AfterHandshakeOutcome, EndpointHooks, VarInt}, protocol::ProtocolHandler
+    endpoint::{AfterHandshakeOutcome, EndpointHooks, VarInt},
+    protocol::ProtocolHandler,
+    EndpointId, PublicKey, Watcher,
 };
+use lru::LruCache;
 use n0_future::StreamExt;
 use tokio::{sync::Mutex, time::timeout};
 use tracing::{debug, warn};
 
 use crate::{
-    ALPN, AUTH_TIMEOUT, Authenticator, AuthenticatorError, auth::{AuthState, RegisterResponse, WatchableRemote}, error::InFlightError
+    auth::{AuthState, RegisterResponse, WatchableRemote},
+    error::InFlightError,
+    Authenticator, AuthenticatorError, ALPN, AUTH_TIMEOUT,
 };
 
 impl ProtocolHandler for Authenticator {
@@ -113,20 +115,11 @@ impl EndpointHooks for Authenticator {
                         watchable.watcher()
                     }
                     AuthState::Authenticated => {
-                        // we try is_authenticated, if not we clear to None and reject
-                        if self.is_authenticated(&conn_info.remote_id()).await {
-                            debug!(
-                                "[after_handshake] already authenticated: {}",
-                                conn_info.remote_id()
-                            );
-                            return AfterHandshakeOutcome::accept();
-                        }
-
-                        warn!("expected {endpoint_id} to be authenticated, resetting");
-                        return AfterHandshakeOutcome::Reject {
-                            error_code: VarInt::from_u32(500),
-                            reason: b"in_flight status indicates already authenticated".to_vec(),
-                        };
+                        debug!(
+                            "[after_handshake] already authenticated: {}",
+                            conn_info.remote_id()
+                        );
+                        return AfterHandshakeOutcome::accept();
                     }
                     AuthState::Blocked => {
                         debug!(
@@ -230,7 +223,6 @@ impl EndpointHooks for Authenticator {
                     "[before_connect] already authenticated (in flight), accepting connection to {}",
                     remote_id
                 );
-                    return iroh::endpoint::BeforeConnectOutcome::Accept;
                 }
             }
             Ok(RegisterResponse::AlreadyBlocked) => {
@@ -253,31 +245,37 @@ impl EndpointHooks for Authenticator {
 }
 
 pub(crate) async fn register_in_flight(
-    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    in_flight: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
     endpoint_id: PublicKey,
 ) -> Result<RegisterResponse, InFlightError> {
     let mut guard = in_flight.lock().await;
-    match guard.entry(endpoint_id) {
-        Entry::Occupied(entry) => match entry.get().state() {
+    if let Some(entry) = guard.get(&endpoint_id) {
+        return match entry.state() {
             AuthState::Unauthenticated => {
-                entry.get().set_state(AuthState::InFlight);
+                entry.set_state(AuthState::InFlight);
                 Ok(RegisterResponse::InFlightRegistered)
             }
             AuthState::Authenticated => Ok(RegisterResponse::AlreadyAuthenticated),
             AuthState::InFlight => Ok(RegisterResponse::AlreadyInFlight),
             AuthState::Blocked => Ok(RegisterResponse::AlreadyBlocked),
-        },
-        Entry::Vacant(entry) => {
-            let watchable = WatchableRemote::new(endpoint_id);
-            watchable.set_state(AuthState::InFlight);
-            entry.insert(watchable);
-            Ok(RegisterResponse::InFlightRegistered)
-        }
+        };
     }
+
+    let watchable = WatchableRemote::new(endpoint_id);
+    watchable.set_state(AuthState::InFlight);
+
+    if let Some(evicted) = guard.put(endpoint_id, watchable) {
+        debug!(
+            "evicting endpoint {} from auth cache due to capacity limit",
+            evicted.id()
+        );
+    }
+
+    Ok(RegisterResponse::InFlightRegistered)
 }
 
 pub(crate) async fn release_in_flight(
-    in_flight: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    in_flight: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
     endpoint_id: PublicKey,
     target_state: AuthState,
 ) -> Result<(), InFlightError> {
@@ -287,34 +285,39 @@ pub(crate) async fn release_in_flight(
         ));
     }
     let mut guard = in_flight.lock().await;
-    match guard.entry(endpoint_id) {
-        Entry::Occupied(entry) => {
-            let c_state = entry.get().state();
-            match c_state {
-                AuthState::InFlight => {
-                    entry.get().set_state(target_state);
-                    Ok(())
-                }
-                _ => Err(InFlightError::PromotionNotAllowed(format!(
-                    "only promote to {} from {} not from {}",
-                    target_state,
-                    AuthState::InFlight,
-                    c_state
-                ))),
+
+    // occupied
+    if let Some(entry) = guard.get(&endpoint_id) {
+        return match entry.state() {
+            AuthState::InFlight => {
+                entry.set_state(target_state);
+                Ok(())
             }
-        }
-        Entry::Vacant(entry) => {
-            debug!("no entry detected, this means we are the accepting side of a auth request, accept target_state unconditionally");
-            let watchable = WatchableRemote::new(endpoint_id);
-            watchable.set_state(target_state);
-            entry.insert(watchable);
-            Ok(())
-        }
+            _ => Err(InFlightError::PromotionNotAllowed(format!(
+                "only promote to {} from {} not from {}",
+                target_state,
+                AuthState::InFlight,
+                entry.state()
+            ))),
+        };
     }
+
+    // vacant
+    let watchable = WatchableRemote::new(endpoint_id);
+    watchable.set_state(target_state);
+
+    if let Some(evicted) = guard.put(endpoint_id, watchable) {
+        debug!(
+            "evicting endpoint {} from auth cache due to capacity limit",
+            evicted.id()
+        );
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn get_auth_state(
-    auth_state: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    auth_state: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
     endpoint_id: PublicKey,
 ) -> Option<WatchableRemote> {
     auth_state.lock().await.get(&endpoint_id).cloned()
