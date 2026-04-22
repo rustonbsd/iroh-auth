@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use hkdf::Hkdf;
 use iroh::{endpoint::Connection, Endpoint, EndpointId, PublicKey};
+use lru::LruCache;
 use n0_watcher::Watchable;
 use secrecy::{ExposeSecret, SecretSlice};
 use sha2::Sha512;
@@ -22,7 +23,7 @@ use crate::{
 pub struct Authenticator {
     secret: SecretSlice<u8>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
-    pub(crate) auth_state: Arc<Mutex<HashMap<EndpointId, WatchableRemote>>>,
+    pub(crate) auth_state: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +114,9 @@ impl Authenticator {
         Self {
             secret: secret.into_secret(),
             endpoint: Arc::new(Mutex::new(None)),
-            auth_state: Arc::new(Mutex::new(HashMap::new())),
+            auth_state: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(crate::LRU_CACHE_SIZE).expect("LRU_CACHE_SIZE must be > 0"),
+            ))),
         }
     }
 
@@ -249,7 +252,9 @@ impl Authenticator {
             .await
             .map_err(|_| {
                 error!("[auth_accept] accept bidirectional stream timed out");
-                AuthenticatorError::AcceptFailed(format!("Accept bidirectional stream timed out"))
+                AuthenticatorError::AcceptFailed(
+                    "Accept bidirectional stream timed out".to_string(),
+                )
             })?
             .map_err(|err| {
                 error!("[auth_accept] accept bidirectional stream failed: {}", err);
@@ -330,7 +335,7 @@ impl Authenticator {
             .await
             .map_err(|_| {
                 error!("[auth_open] open bidirectional stream timed out");
-                AuthenticatorError::OpenFailed(format!("Open bidirectional stream timed out"))
+                AuthenticatorError::OpenFailed("Open bidirectional stream timed out".to_string())
             })?
             .map_err(|err| {
                 error!("[auth_open] open bidirectional stream failed: {}", err);
@@ -412,7 +417,6 @@ impl Authenticator {
     pub(crate) async fn spawn_auth_worker(&self, remote_id: EndpointId, endpoint: Endpoint) {
         tokio::spawn({
             let auth = self.clone();
-            let remote_id = remote_id.clone();
             let in_flight_ref = self.auth_state.clone();
             let start_time = Instant::now();
             async move {

@@ -161,10 +161,11 @@ mod tests {
     ) -> Result<bool, String> {
         let auth_a = Authenticator::new(secret_a);
         let mut endpoint_a_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0);
-        for i in 0..parallel_count {
-            endpoint_a_builder =
-                endpoint_a_builder.alpns(vec![format!("/dummy/{}", i).into_bytes()]);
-        }
+        let alpns = (0..parallel_count)
+            .map(|i| format!("/dummy/{}", i).into_bytes())
+            .collect();
+        endpoint_a_builder = endpoint_a_builder.alpns(alpns);
+        
         let endpoint_a = endpoint_a_builder
             .hooks(auth_a.clone())
             .bind()
@@ -174,10 +175,10 @@ mod tests {
 
         let auth_b = Authenticator::new(secret_b);
         let mut endpoint_b_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0);
-        for i in 0..parallel_count {
-            endpoint_b_builder =
-                endpoint_b_builder.alpns(vec![format!("/dummy/{}", i).into_bytes()]);
-        }
+        let alpns = (0..parallel_count)
+            .map(|i| format!("/dummy/{}", i).into_bytes())
+            .collect();
+        endpoint_b_builder = endpoint_b_builder.alpns(alpns);
         let endpoint_b = endpoint_b_builder
             /*.clear_relay_transports()
             .relay_mode(iroh::RelayMode::Custom(

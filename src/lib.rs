@@ -12,6 +12,7 @@ pub use auth::Authenticator;
 pub const ALPN: &[u8] = b"/iroh/auth/0.1";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSMISSION_TIMEOUT: Duration = Duration::from_millis(5000);
+const LRU_CACHE_SIZE: usize = 10_000;
 
 #[cfg(test)]
 mod tests;

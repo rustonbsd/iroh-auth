@@ -23,7 +23,7 @@ async fn main() -> Result<(), String> {
 
         // #1 Create Authenticator
         let auth = Authenticator::new("my-secure-network-secret-12345");
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             // #2 Add auth hooks
             .hooks(auth.clone())
             .bind()
@@ -31,7 +31,7 @@ async fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         // #3 Pass endpoint to the Authenticator for establishing auth connections
-        auth.set_endpoint(&endpoint);
+        auth.set_endpoint(&endpoint).await;
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
