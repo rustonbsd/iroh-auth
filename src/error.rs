@@ -24,7 +24,7 @@ impl std::fmt::Display for AuthenticatorError {
             AuthenticatorError::OpenFailed(msg) => write!(f, "Open failed: {}", msg),
             AuthenticatorError::EndpointNotSet => write!(
                 f,
-                "Authenticator endpoint not set: missing authenticator.start(endpoint)"
+                "Authenticator endpoint not set: missing authenticator.start(endpoint).await"
             ),
             AuthenticatorError::AcceptFailedAndBlock(msg, id) => {
                 write!(f, "Blocked endpoint ID: {}: {}", msg, id)

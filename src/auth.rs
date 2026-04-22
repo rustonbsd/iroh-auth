@@ -425,8 +425,10 @@ impl Authenticator {
                         "[before_connect] background: connecting to {} for auth",
                         remote_id
                     );
-                    match endpoint.connect(remote_id, ALPN).await {
-                        Ok(conn) => {
+                    let t = AUTH_TIMEOUT
+                        .saturating_sub(Instant::now().saturating_duration_since(start_time));
+                    match timeout(t, endpoint.connect(remote_id, ALPN)).await {
+                        Ok(Ok(conn)) => {
                             debug!(
                                 "[before_connect] background: connected to {}, performing auth",
                                 remote_id
@@ -477,9 +479,15 @@ impl Authenticator {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(
                                 "[before_connect] background: failed to open connection for authentication to {}: {}, retrying...",
+                                remote_id, e
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[before_connect] background: connection attempt timed out for {}: {}, retrying...",
                                 remote_id, e
                             );
                         }
