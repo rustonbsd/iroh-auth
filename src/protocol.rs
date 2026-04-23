@@ -8,7 +8,7 @@ use iroh::{
 use lru::LruCache;
 use n0_future::StreamExt;
 use tokio::{sync::Mutex, time::timeout};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     auth::{AuthState, RegisterResponse, WatchableRemote},
@@ -211,11 +211,15 @@ impl EndpointHooks for Authenticator {
                 let endpoint = match self.endpoint().await {
                     Ok(ep) => ep,
                     Err(_) => {
-                        warn!("[before_connect] authenticator endpoint not set");
+                        error!("[before_connect] authenticator endpoint not set");
                         return iroh::endpoint::BeforeConnectOutcome::Reject;
                     }
                 };
-                self.spawn_auth_worker(remote_id, endpoint).await;
+                if self.perform_auth(remote_id, endpoint).await.is_err() {
+                    iroh::endpoint::BeforeConnectOutcome::Reject
+                } else {
+                    iroh::endpoint::BeforeConnectOutcome::Accept
+                }
             }
             Ok(RegisterResponse::AlreadyInFlight) | Ok(RegisterResponse::AlreadyAuthenticated) => {
                 if self.is_authenticated(&remote_id).await {
@@ -224,23 +228,23 @@ impl EndpointHooks for Authenticator {
                     remote_id
                 );
                 }
+                iroh::endpoint::BeforeConnectOutcome::Accept
             }
             Ok(RegisterResponse::AlreadyBlocked) => {
                 debug!(
                     "[before_connect] endpoint {} is blocked, rejecting connection",
                     remote_id
                 );
-                return iroh::endpoint::BeforeConnectOutcome::Reject;
+                iroh::endpoint::BeforeConnectOutcome::Reject
             }
             Err(err) => {
                 warn!(
                     "[before_connect] failed to register in-flight auth for {}: {}",
                     remote_id, err
                 );
-                return iroh::endpoint::BeforeConnectOutcome::Reject;
+                iroh::endpoint::BeforeConnectOutcome::Reject
             }
         }
-        iroh::endpoint::BeforeConnectOutcome::Accept
     }
 }
 

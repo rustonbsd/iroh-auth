@@ -414,97 +414,135 @@ impl Authenticator {
 }
 
 impl Authenticator {
-    pub(crate) async fn spawn_auth_worker(&self, remote_id: EndpointId, endpoint: Endpoint) {
-        tokio::spawn({
-            let auth = self.clone();
-            let in_flight_ref = self.auth_state.clone();
-            let start_time = Instant::now();
-            async move {
-                while start_time.elapsed() < AUTH_TIMEOUT {
+    pub(crate) async fn perform_auth(
+        &self,
+        remote_id: EndpointId,
+        endpoint: Endpoint,
+    ) -> Result<(), AuthenticatorError> {
+        tokio::time::timeout(AUTH_TIMEOUT, endpoint.online())
+            .await
+            .map_err(|_| {
+                AuthenticatorError::OpenFailed(
+                    "[before_connect] awaiting endpoint.online() timed out".to_string(),
+                )
+            })
+            .map_err(|err| {
+                AuthenticatorError::OpenFailed(format!(
+                    "[before_connect] awaiting endpoint.online() failed: {}",
+                    err
+                ))
+            })?;
+
+        let start_time = Instant::now();
+        while start_time.elapsed() < AUTH_TIMEOUT {
+            debug!(
+                "[before_connect] background: connecting to {} for auth",
+                remote_id
+            );
+            let t =
+                AUTH_TIMEOUT.saturating_sub(Instant::now().saturating_duration_since(start_time));
+            match timeout(t, endpoint.connect(remote_id, ALPN)).await {
+                Ok(Ok(conn)) => {
                     debug!(
-                        "[before_connect] background: connecting to {} for auth",
+                        "[before_connect] connected to {}, performing auth",
                         remote_id
                     );
-                    let t = AUTH_TIMEOUT
-                        .saturating_sub(Instant::now().saturating_duration_since(start_time));
-                    match timeout(t, endpoint.connect(remote_id, ALPN)).await {
-                        Ok(Ok(conn)) => {
+                    match timeout(AUTH_TIMEOUT, self.auth_open(conn)).await {
+                        Ok(Ok(())) => {
                             debug!(
-                                "[before_connect] background: connected to {}, performing auth",
+                                "[before_connect] authentication successful for {}",
                                 remote_id
                             );
-                            match timeout(AUTH_TIMEOUT, auth.auth_open(conn)).await {
-                                Ok(Ok(())) => {
-                                    debug!(
-                                        "[before_connect] background: authentication successful for {}",
-                                        remote_id
-                                    );
 
-                                    release_in_flight(
-                                        in_flight_ref.clone(),
-                                        remote_id,
-                                        AuthState::Authenticated,
-                                    )
-                                    .await
-                                    .ok();
-                                    return;
-                                }
-                                Ok(Err(err)) => match &err {
-                                    AuthenticatorError::OpenFailedAndBlock(msg, public_key) => {
-                                        warn!(
-                                            "[before_connect] authentication failed and blocking {}: {}",
-                                            public_key, msg
-                                        );
-                                        release_in_flight(
-                                            in_flight_ref.clone(),
-                                            remote_id,
-                                            AuthState::Blocked,
-                                        )
-                                        .await
-                                        .ok();
-                                        return;
-                                    }
-                                    _ => {
-                                        warn!(
-                                            "[before_connect] authentication failed for {}: {}",
-                                            remote_id, err
-                                        );
-                                    }
-                                },
-                                Err(_) => {
-                                    warn!(
-                                        "[before_connect] background: authentication timed out for {}, retrying...",
-                                        remote_id
-                                    );
-                                }
+                            release_in_flight(
+                                self.auth_state.clone(),
+                                remote_id,
+                                AuthState::Authenticated,
+                            )
+                            .await
+                            .map_err(|err| {
+                                AuthenticatorError::OpenFailed(format!(
+                                    "[before_connect] failed to release in-flight state for {}: {}",
+                                    remote_id, err
+                                ))
+                            })?;
+                            return Ok(());
+                        }
+                        Ok(Err(err)) => match &err {
+                            AuthenticatorError::OpenFailedAndBlock(msg, public_key) => {
+                                warn!(
+                                    "[before_connect] authentication failed and blocking {}: {}",
+                                    public_key, msg
+                                );
+                                release_in_flight(
+                                    self.auth_state.clone(),
+                                    remote_id,
+                                    AuthState::Blocked,
+                                )
+                                .await
+                                .map_err(|err| {
+                                    AuthenticatorError::OpenFailedAndBlock(format!(
+                                        "[before_connect] failed to release in-flight state for {}: {}",
+                                        public_key, err
+                                    ), *public_key)
+                                })?;
+                                return Err(AuthenticatorError::OpenFailedAndBlock(
+                                    msg.clone(),
+                                    *public_key,
+                                ));
                             }
-                        }
-                        Ok(Err(e)) => {
+                            _ => {
+                                warn!(
+                                    "[before_connect] authentication failed for {}: {}",
+                                    remote_id, err
+                                );
+                            }
+                        },
+                        Err(_) => {
                             warn!(
-                                "[before_connect] background: failed to open connection for authentication to {}: {}, retrying...",
-                                remote_id, e
+                                "[before_connect] authentication timed out for {}, retrying...",
+                                remote_id
                             );
                         }
-                        Err(e) => {
-                            warn!(
-                                "[before_connect] background: connection attempt timed out for {}: {}, retrying...",
-                                remote_id, e
-                            );
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
+                Ok(Err(e)) => {
+                    warn!(
+                            "[before_connect] failed to open connection for authentication to {}: {}, retrying...",
+                            remote_id, e
+                        );
+                }
+                Err(e) => {
+                    warn!(
+                        "[before_connect] connection attempt timed out for {}: {}, retrying...",
+                        remote_id, e
+                    );
+                }
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
 
-                warn!(
-                    "[before_connect] background: authentication timed out for {}",
-                    remote_id
-                );
+        warn!(
+            "[before_connect] background: authentication timed out for {}",
+            remote_id
+        );
 
-                // Timeout no more retries, clean up in-flight state
-                release_in_flight(in_flight_ref.clone(), remote_id, AuthState::Unauthenticated)
-                    .await
-                    .ok();
-            }
-        });
+        // Timeout no more retries, clean up in-flight state
+        release_in_flight(
+            self.auth_state.clone(),
+            remote_id,
+            AuthState::Unauthenticated,
+        )
+        .await
+        .map_err(|err| {
+            AuthenticatorError::OpenFailed(format!(
+                "[before_connect] failed to release in-flight state for {}: {}",
+                remote_id, err
+            ))
+        })?;
+        Err(AuthenticatorError::OpenFailed(format!(
+            "Authentication timed out for {}",
+            remote_id
+        )))
     }
 }
