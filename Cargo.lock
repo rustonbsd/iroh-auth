@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-auth"
-version = "0.2.0"
+version = "0.2.0-pre.1"
 dependencies = [
  "anyhow",
  "hkdf",
