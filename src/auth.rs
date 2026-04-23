@@ -419,7 +419,8 @@ impl Authenticator {
         remote_id: EndpointId,
         endpoint: Endpoint,
     ) -> Result<(), AuthenticatorError> {
-        tokio::time::timeout(AUTH_TIMEOUT, endpoint.online())
+        let start_time = Instant::now();
+        timeout(AUTH_TIMEOUT, endpoint.online())
             .await
             .map_err(|_| {
                 AuthenticatorError::OpenFailed(
@@ -432,22 +433,29 @@ impl Authenticator {
                     err
                 ))
             })?;
-
-        let start_time = Instant::now();
+            
         while start_time.elapsed() < AUTH_TIMEOUT {
             debug!(
                 "[before_connect] background: connecting to {} for auth",
                 remote_id
             );
-            let t =
-                AUTH_TIMEOUT.saturating_sub(Instant::now().saturating_duration_since(start_time));
-            match timeout(t, endpoint.connect(remote_id, ALPN)).await {
+            match timeout(
+                remaining_timeout(start_time, AUTH_TIMEOUT),
+                endpoint.connect(remote_id, ALPN),
+            )
+            .await
+            {
                 Ok(Ok(conn)) => {
                     debug!(
                         "[before_connect] connected to {}, performing auth",
                         remote_id
                     );
-                    match timeout(AUTH_TIMEOUT, self.auth_open(conn)).await {
+                    match timeout(
+                        remaining_timeout(start_time, AUTH_TIMEOUT),
+                        self.auth_open(conn),
+                    )
+                    .await
+                    {
                         Ok(Ok(())) => {
                             debug!(
                                 "[before_connect] authentication successful for {}",
@@ -545,4 +553,8 @@ impl Authenticator {
             remote_id
         )))
     }
+}
+
+fn remaining_timeout(start: Instant, timeout_duration: Duration) -> Duration {
+    timeout_duration.saturating_sub(Instant::now().saturating_duration_since(start))
 }
