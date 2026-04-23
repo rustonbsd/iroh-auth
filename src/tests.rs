@@ -31,8 +31,8 @@ mod tests {
 
         assert_ne!(token_a, token_b);
 
-        let key_a = spake_a.finish(&token_b).unwrap();
-        let key_b = spake_b.finish(&token_a).unwrap();
+        let key_a = spake_a.finish(&token_b).expect("SPAKE2 A failed to finish");
+        let key_b = spake_b.finish(&token_a).expect("SPAKE2 B failed to finish");
 
         assert_eq!(key_a, key_b);
     }
@@ -49,23 +49,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_auth_success() {
         let secret = b"supersecrettoken1234567890123456";
-        assert!(run_auth_test(secret, secret).await.unwrap());
+        assert!(run_auth_test(secret, secret)
+            .await
+            .expect("Auth test failed"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_auth_parallel() {
-        // enable logs for this test debug (only iroh_auth::debug)
-        //tracing_subscriber::fmt()
-        //    .with_env_filter(tracing_subscriber::EnvFilter::new("iroh_auth=debug"))
-        //    .init();
-
         let secret = b"supersecrettoken1234567890123456";
         let worked = Arc::new(AtomicUsize::new(0));
         let count = 10;
         for _ in 0..count {
             let worked = worked.clone();
             tokio::spawn(async move {
-                assert!(run_auth_parallel_test(secret, secret, count).await.unwrap());
+                assert!(run_auth_parallel_test(secret, secret, count)
+                    .await
+                    .expect("auth_parallel test failed"));
                 worked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             });
         }
@@ -79,7 +78,9 @@ mod tests {
     async fn test_auth_failure() {
         let secret_a = b"supersecrettoken1234567890123456";
         let secret_b = b"differentsecrettoken123456789012";
-        assert!(!run_auth_test(secret_a, secret_b).await.unwrap());
+        assert!(!run_auth_test(secret_a, secret_b)
+            .await
+            .expect("Auth failure test failed"));
     }
 
     async fn run_auth_test(
@@ -165,7 +166,7 @@ mod tests {
             .map(|i| format!("/dummy/{}", i).into_bytes())
             .collect();
         endpoint_a_builder = endpoint_a_builder.alpns(alpns);
-        
+
         let endpoint_a = endpoint_a_builder
             .hooks(auth_a.clone())
             .bind()
@@ -180,10 +181,6 @@ mod tests {
             .collect();
         endpoint_b_builder = endpoint_b_builder.alpns(alpns);
         let endpoint_b = endpoint_b_builder
-            /*.clear_relay_transports()
-            .relay_mode(iroh::RelayMode::Custom(
-                RelayMap::try_from_iter(["https://iroh-relay.rustonbsd.com"]).unwrap(),
-            )) */
             .hooks(auth_b.clone())
             .bind()
             .await
@@ -208,36 +205,43 @@ mod tests {
             .accept(Authenticator::ALPN, auth_b.clone())
             .spawn();
 
+        let success = Arc::new(AtomicUsize::new(0));
         for i in 0..parallel_count {
             tokio::time::sleep(Duration::from_millis(100)).await;
             tokio::spawn({
                 let endpoint_a = endpoint_a.clone();
                 let endpoint_b = endpoint_b.clone();
+                let success = success.clone();
                 async move {
-                    endpoint_a
+                    if endpoint_a
                         .connect(
                             endpoint_b.addr(),
                             format!("/dummy/{}", i).into_bytes().as_slice(),
                         )
                         .await
-                        .ok();
+                        .is_ok()
+                    {
+                        success.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             });
         }
 
         let wait_loop = async {
             let wait_a = async {
-                while auth_a.list_authenticated().await.is_empty()
-                    && auth_a.list_blocked().await.is_empty()
+                while auth_a.list_authenticated().await.len() + auth_a.list_blocked().await.len()
+                    < 1
+                    || success.load(std::sync::atomic::Ordering::SeqCst) < parallel_count
                 {
-                    time::sleep(Duration::from_millis(100)).await;
+                    time::sleep(Duration::from_millis(1000)).await;
                 }
             };
             let wait_b = async {
-                while auth_b.list_authenticated().await.is_empty()
-                    && auth_b.list_blocked().await.is_empty()
+                while auth_b.list_authenticated().await.len() + auth_b.list_blocked().await.len()
+                    < 1
+                    || success.load(std::sync::atomic::Ordering::SeqCst) < parallel_count
                 {
-                    time::sleep(Duration::from_millis(100)).await;
+                    time::sleep(Duration::from_millis(1000)).await;
                 }
             };
             tokio::join!(wait_a, wait_b);
