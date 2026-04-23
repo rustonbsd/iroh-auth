@@ -48,8 +48,8 @@ impl std::fmt::Display for AuthState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RegisterResponse {
     InFlightRegistered,   // auth after this
-    AlreadyInFlight, // another auth was running while we called this, only check is_authenticaded, don't auth again
-    AlreadyAuthenticated, // we are already authenticaded, same as AlreadyInFlight => only check is_authenticaded, don't auth again
+    AlreadyInFlight, // another auth was running while we called this, only check is_authenticated, don't auth again
+    AlreadyAuthenticated, // we are already authenticated, same as AlreadyInFlight => only check is_authenticated, don't auth again
     AlreadyBlocked,       // we are blocked, DO NOT AUTH AGAIN, just reject
 }
 
@@ -223,18 +223,20 @@ impl Authenticator {
                     )
                 }
             })
-            .map_err(|err| {
-                if open {
-                    AuthenticatorError::OpenFailed(format!(
-                        "Failed to wait for stream stopped: {}",
-                        err
-                    ))
-                } else {
-                    AuthenticatorError::AcceptFailed(format!(
-                        "Failed to wait for stream stopped: {}",
-                        err
-                    ))
-                }
+            .and_then(|res| {
+                res.map_err(|err| {
+                    if open {
+                        AuthenticatorError::OpenFailed(format!(
+                            "Failed to read remaining data from stream: {}",
+                            err
+                        ))
+                    } else {
+                        AuthenticatorError::AcceptFailed(format!(
+                            "Failed to read remaining data from stream: {}",
+                            err
+                        ))
+                    }
+                })
             })
         {
             warn!("[end_of_auth] {}", err);
@@ -420,20 +422,30 @@ impl Authenticator {
         endpoint: Endpoint,
     ) -> Result<(), AuthenticatorError> {
         let start_time = Instant::now();
-        timeout(AUTH_TIMEOUT, endpoint.online())
+        if let Err(err) = timeout(AUTH_TIMEOUT, endpoint.online()).await.map_err(|_| {
+            AuthenticatorError::OpenFailed(
+                "[before_connect] awaiting endpoint.online() timed out".to_string(),
+            )
+        }) {
+            error!(
+                "[before_connect] awaiting endpoint.online() failed: {}",
+                err
+            );
+            release_in_flight(
+                self.auth_state.clone(),
+                remote_id,
+                AuthState::Unauthenticated,
+            )
             .await
-            .map_err(|_| {
-                AuthenticatorError::OpenFailed(
-                    "[before_connect] awaiting endpoint.online() timed out".to_string(),
-                )
-            })
             .map_err(|err| {
                 AuthenticatorError::OpenFailed(format!(
-                    "[before_connect] awaiting endpoint.online() failed: {}",
-                    err
+                    "[before_connect] failed to release in-flight state for {}: {}",
+                    remote_id, err
                 ))
             })?;
-            
+            return Err(err);
+        }
+
         while start_time.elapsed() < AUTH_TIMEOUT {
             debug!(
                 "[before_connect] background: connecting to {} for auth",

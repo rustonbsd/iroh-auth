@@ -206,8 +206,6 @@ impl EndpointHooks for Authenticator {
                     remote_id
                 );
 
-                // We spawn the authentication worker in a new task
-                // before_connect returns directly with BeforeConnectOutcome::Accept
                 let endpoint = match self.endpoint().await {
                     Ok(ep) => ep,
                     Err(_) => {
