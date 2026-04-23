@@ -51,7 +51,7 @@ async fn main() -> Result<(), String> {
 
     // 3. The authenticator needs a reference to the bound endpoint 
     // to initiate authentication handshakes.
-    auth.set_endpoint(&endpoint);
+    auth.set_endpoint(&endpoint).await;
 
     // 4. Register the auth protocol handler
     let router = Router::builder(endpoint)
