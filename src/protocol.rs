@@ -76,15 +76,12 @@ impl EndpointHooks for Authenticator {
         &'a self,
         conn_info: &'a iroh::endpoint::ConnectionInfo,
     ) -> iroh::endpoint::AfterHandshakeOutcome {
-        if self.is_authenticated(&conn_info.remote_id()).await {
-            debug!(
-                "[after_handshake] already authenticated: {}",
-                conn_info.remote_id()
-            );
+        let endpoint_id = conn_info.remote_id();
+        if self.is_authenticated(&endpoint_id).await {
+            debug!("[after_handshake] already authenticated: {}", endpoint_id);
             return AfterHandshakeOutcome::accept();
         }
 
-        let endpoint_id = conn_info.remote_id();
         if conn_info.alpn() == ALPN {
             debug!(
                 "[after_handshake] accepting auth connection: {}",
@@ -94,54 +91,99 @@ impl EndpointHooks for Authenticator {
         }
 
         // wait for authentication to complete
-        let in_flight_watcher =
-            if let Some(watchable) = get_auth_state(self.auth_state.clone(), endpoint_id).await {
-                match watchable.state() {
-                    AuthState::Unauthenticated => {
-                        debug!(
-                            "[after_handshake] no in-flight auth for {}, rejecting connection",
-                            endpoint_id
-                        );
-                        return AfterHandshakeOutcome::Reject {
-                            error_code: VarInt::from_u32(401),
-                            reason: b"No authentication in progress".to_vec(),
-                        };
-                    }
-                    AuthState::InFlight => {
-                        debug!(
-                            "[after_handshake] waiting for in-flight auth for {}",
-                            endpoint_id
-                        );
-                        watchable.watcher()
-                    }
-                    AuthState::Authenticated => {
-                        debug!(
-                            "[after_handshake] already authenticated: {}",
-                            conn_info.remote_id()
-                        );
-                        return AfterHandshakeOutcome::accept();
-                    }
-                    AuthState::Blocked => {
-                        debug!(
-                            "[after_handshake] endpoint {} is blocked, rejecting connection",
-                            endpoint_id
-                        );
-                        return AfterHandshakeOutcome::Reject {
-                            error_code: VarInt::from_u32(403),
-                            reason: b"Endpoint is blocked".to_vec(),
-                        };
+        let in_flight_watcher = if let Some(watchable) =
+            get_auth_state(self.auth_state.clone(), endpoint_id).await
+        {
+            match watchable.state() {
+                AuthState::Unauthenticated => {
+                    debug!("[after_handshake] no in-flight auth for {}, we are asymetric (the other node successfully authed but we didn't), initiating auth ourself",endpoint_id);
+                    match register_in_flight(self.auth_state.clone(), endpoint_id).await {
+                        Ok(RegisterResponse::AlreadyInFlight) => {
+                            debug!(
+                                    "[after_handshake] already in-flight auth for {}, waiting for it to complete",
+                                    endpoint_id
+                                );
+                            watchable.watcher()
+                        }
+                        Ok(RegisterResponse::InFlightRegistered) => {
+                            debug!(
+                                    "[after_handshake] registered in-flight auth for {}, performing auth",
+                                    endpoint_id
+                                );
+                            let endpoint = match self.endpoint().await {
+                                Ok(ep) => ep,
+                                Err(_) => {
+                                    error!("[after_handshake] authenticator endpoint not set");
+                                    return AfterHandshakeOutcome::Reject {
+                                        error_code: VarInt::from_u32(500),
+                                        reason: b"Internal server error".to_vec(),
+                                    };
+                                }
+                            };
+                            if let Err(err) = self.perform_auth(endpoint_id, endpoint).await {
+                                debug!(
+                                        "[after_handshake] authentication failed for {}, rejecting connection with error: {}",
+                                        endpoint_id, err
+                                    );
+                                return AfterHandshakeOutcome::Reject {
+                                    error_code: VarInt::from_u32(401),
+                                    reason: b"Authentication failed".to_vec(),
+                                };
+                            } else {
+                                debug!(
+                                    "[after_handshake] authentication succeeded for {}, waiting for state update",
+                                    endpoint_id
+                                );
+                                return iroh::endpoint::AfterHandshakeOutcome::accept();
+                            }
+                        }
+                        _ => {
+                            debug!(
+                                    "[after_handshake] failed to register in-flight auth for {}, rejecting connection",
+                                    endpoint_id
+                                );
+                            return AfterHandshakeOutcome::Reject {
+                                error_code: VarInt::from_u32(401),
+                                reason: b"Authentication failed".to_vec(),
+                            };
+                        }
                     }
                 }
-            } else {
-                debug!(
-                    "[after_handshake] no in-flight auth for {}, rejecting connection",
-                    endpoint_id
-                );
-                return AfterHandshakeOutcome::Reject {
-                    error_code: VarInt::from_u32(401),
-                    reason: b"No authentication in progress".to_vec(),
-                };
+                AuthState::InFlight => {
+                    debug!(
+                        "[after_handshake] waiting for in-flight auth for {}",
+                        endpoint_id
+                    );
+                    watchable.watcher()
+                }
+                AuthState::Authenticated => {
+                    debug!(
+                        "[after_handshake] already authenticated: {}",
+                        conn_info.remote_id()
+                    );
+                    return AfterHandshakeOutcome::accept();
+                }
+                AuthState::Blocked => {
+                    debug!(
+                        "[after_handshake] endpoint {} is blocked, rejecting connection",
+                        endpoint_id
+                    );
+                    return AfterHandshakeOutcome::Reject {
+                        error_code: VarInt::from_u32(403),
+                        reason: b"Endpoint is blocked".to_vec(),
+                    };
+                }
+            }
+        } else {
+            debug!(
+                "[after_handshake] no in-flight auth for {}, rejecting connection",
+                endpoint_id
+            );
+            return AfterHandshakeOutcome::Reject {
+                error_code: VarInt::from_u32(401),
+                reason: b"No authentication in progress".to_vec(),
             };
+        };
 
         let wait_for_auth = async {
             let mut stream = in_flight_watcher.watch().stream();
