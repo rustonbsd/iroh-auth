@@ -5,7 +5,11 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{Authenticator, IntoSecret, AUTH_TIMEOUT};
+    use crate::{
+        auth::AuthState,
+        protocol::{register_in_flight, release_in_flight},
+        Authenticator, IntoSecret, AUTH_TIMEOUT,
+    };
     use iroh::{endpoint::Connection, protocol::ProtocolHandler};
     use secrecy::SecretSlice;
     use spake2::{Ed25519Group, Identity, Password, Spake2};
@@ -81,6 +85,14 @@ mod tests {
         assert!(!run_auth_test(secret_a, secret_b)
             .await
             .expect("Auth failure test failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_auth_asymmetric_retry() {
+        let secret = b"supersecrettoken1234567890123456";
+        assert!(run_auth_asymmetric_retry_test(secret)
+            .await
+            .expect("Auth asymmetric retry test failed"));
     }
 
     async fn run_auth_test(
@@ -258,6 +270,90 @@ mod tests {
 
         Ok(auth_a.is_authenticated(&endpoint_b.id()).await
             && auth_b.is_authenticated(&endpoint_a.id()).await)
+    }
+
+    async fn run_auth_asymmetric_retry_test(secret: &'static [u8]) -> Result<bool, String> {
+        let auth_a = Authenticator::new(secret);
+        let endpoint_a = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![b"/dummy/1".to_vec()])
+            .hooks(auth_a.clone())
+            .bind()
+            .await
+            .map_err(|e| e.to_string())?;
+        auth_a.set_endpoint(&endpoint_a).await;
+
+        let auth_b = Authenticator::new(secret);
+        let endpoint_b = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![b"/dummy/1".to_vec()])
+            .hooks(auth_b.clone())
+            .bind()
+            .await
+            .map_err(|e| e.to_string())?;
+        auth_b.set_endpoint(&endpoint_b).await;
+
+        let router_a = iroh::protocol::Router::builder(endpoint_a.clone())
+            .accept(Authenticator::ALPN, auth_a.clone())
+            .accept(b"/dummy/1", DummyProtocol)
+            .spawn();
+
+        let router_b = iroh::protocol::Router::builder(endpoint_b.clone())
+            .accept(Authenticator::ALPN, auth_b.clone())
+            .accept(b"/dummy/1", DummyProtocol)
+            .spawn();
+
+        register_in_flight(auth_a.auth_state.clone(), endpoint_b.id())
+            .await
+            .map_err(|e| e.to_string())?;
+        release_in_flight(
+            auth_a.auth_state.clone(),
+            endpoint_b.id(),
+            AuthState::Authenticated,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        register_in_flight(auth_b.auth_state.clone(), endpoint_a.id())
+            .await
+            .map_err(|e| e.to_string())?;
+        release_in_flight(
+            auth_b.auth_state.clone(),
+            endpoint_a.id(),
+            AuthState::Unauthenticated,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        endpoint_a.online().await;
+        endpoint_b.online().await;
+
+        let retry = tokio::spawn({
+            let endpoint_a = endpoint_a.clone();
+            let endpoint_b = endpoint_b.clone();
+            async move { endpoint_a.connect(endpoint_b.addr(), b"/dummy/1").await }
+        });
+
+        let retry_result = timeout(AUTH_TIMEOUT, retry)
+            .await
+            .map_err(|_| "Authentication retry did not complete in time".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        time::sleep(Duration::from_millis(250)).await;
+
+        let a_authenticated = auth_a.is_authenticated(&endpoint_b.id()).await;
+        let b_authenticated = auth_b.is_authenticated(&endpoint_a.id()).await;
+
+        router_a.shutdown().await.ok();
+        router_b.shutdown().await.ok();
+
+        if retry_result.is_err() {
+            return Err("Authentication retry failed".to_string());
+        }
+
+        if !a_authenticated {
+            return Err("Node A lost authenticated state".to_string());
+        }
+
+        Ok(a_authenticated && b_authenticated)
     }
 
     #[test]

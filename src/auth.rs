@@ -312,7 +312,7 @@ impl Authenticator {
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
 
-        self.end_of_auth(&mut send, &mut recv, false).await?;
+        let _ = self.end_of_auth(&mut send, &mut recv, false).await;
 
         if !bool::from(remote_open_key.ct_eq(&open_key)) {
             error!("[auth_accept] remote open_key mismatch");
@@ -395,7 +395,7 @@ impl Authenticator {
             // that the accept_key was correct to avoid leaking information to an attacker about valid accept_keys
             // (probably not needed but better safe than sorry ^^)
             send.write_all(&rand::random::<[u8; 64]>()).await.ok();
-            self.end_of_auth(&mut send, &mut recv, true).await?;
+            let _ = self.end_of_auth(&mut send, &mut recv, true).await;
 
             return Err(AuthenticatorError::OpenFailedAndBlock(
                 "Remote accept_key mismatch".to_string(),
@@ -407,7 +407,7 @@ impl Authenticator {
             error!("[auth_open] failed to write open_key: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
-        self.end_of_auth(&mut send, &mut recv, true).await?;
+        let _ = self.end_of_auth(&mut send, &mut recv, true).await;
 
         info!("[auth_open] authenticated connection to {}", remote_id);
 
