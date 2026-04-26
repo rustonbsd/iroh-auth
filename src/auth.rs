@@ -481,6 +481,10 @@ impl Authenticator {
                             )
                             .await
                             .map_err(|err| {
+                                error!(
+                                    "[before_connect] failed to release in-flight state for {}: {}",
+                                    remote_id, err
+                                );
                                 AuthenticatorError::OpenFailed(format!(
                                     "[before_connect] failed to release in-flight state for {}: {}",
                                     remote_id, err

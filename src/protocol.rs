@@ -8,7 +8,7 @@ use iroh::{
 use lru::LruCache;
 use n0_future::StreamExt;
 use tokio::{sync::Mutex, time::timeout};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::{AuthState, RegisterResponse, WatchableRemote},
@@ -121,7 +121,7 @@ impl EndpointHooks for Authenticator {
                                 }
                             };
                             if let Err(err) = self.perform_auth(endpoint_id, endpoint).await {
-                                debug!(
+                                error!(
                                         "[after_handshake] authentication failed for {}, rejecting connection with error: {}",
                                         endpoint_id, err
                                     );
@@ -130,6 +130,10 @@ impl EndpointHooks for Authenticator {
                                     reason: b"Authentication failed".to_vec(),
                                 };
                             } else {
+                                info!(
+                                    "[after_handshake] authentication succeeded for {}",
+                                    endpoint_id
+                                );
                                 debug!(
                                     "[after_handshake] authentication succeeded for {}, waiting for state update",
                                     endpoint_id
@@ -255,9 +259,17 @@ impl EndpointHooks for Authenticator {
                         return iroh::endpoint::BeforeConnectOutcome::Reject;
                     }
                 };
-                if self.perform_auth(remote_id, endpoint).await.is_err() {
+                if let Err(err) = self.perform_auth(remote_id, endpoint).await {
+                    error!(
+                        "[before_connect] authentication failed for {}, rejecting connection with error: {}",
+                        remote_id, err
+                    );
                     iroh::endpoint::BeforeConnectOutcome::Reject
                 } else {
+                    info!(
+                        "[before_connect] authentication succeeded for {}",
+                        remote_id
+                    );
                     iroh::endpoint::BeforeConnectOutcome::Accept
                 }
             }
@@ -337,12 +349,38 @@ pub(crate) async fn release_in_flight(
                 entry.set_state(target_state);
                 Ok(())
             }
-            _ => Err(InFlightError::PromotionNotAllowed(format!(
-                "only promote to {} from {} not from {}",
-                target_state,
-                AuthState::InFlight,
-                entry.state()
-            ))),
+            AuthState::Authenticated => {
+                if target_state == AuthState::Blocked {
+                    entry.set_state(AuthState::Blocked);
+                    debug!(
+                        "endpoint {} was authenticated but is now blocked, updating state to Blocked",
+                        endpoint_id
+                    );
+                    Ok(())
+                } else {
+                    debug!(
+                        "endpoint {} is already authenticated, no-op",
+                        endpoint_id
+                    );
+                    Ok(())
+                }
+            }
+            current_state => {
+                if current_state == target_state {
+                    debug!(
+                        "endpoint {} is already in target state {}, no state change needed",
+                        endpoint_id, target_state
+                    );
+                    Ok(())
+                } else {
+                    Err(InFlightError::PromotionNotAllowed(format!(
+                        "only promote to {} from {} not from {}",
+                        target_state,
+                        AuthState::InFlight,
+                        entry.state()
+                    )))
+                }
+            }
         };
     }
 
