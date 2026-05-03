@@ -8,7 +8,7 @@ use iroh::{
 use lru::LruCache;
 use n0_future::StreamExt;
 use tokio::{sync::Mutex, time::timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     auth::{AuthState, RegisterResponse, WatchableRemote},
@@ -22,8 +22,13 @@ impl ProtocolHandler for Authenticator {
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
         let remote_id = connection.remote_id();
+        trace!("[accept] starting auth protocol accept for {}", remote_id);
         let res = match timeout(AUTH_TIMEOUT, self.auth_accept(connection)).await {
             Ok(Ok(())) => {
+                trace!(
+                    "[accept] auth_accept succeeded for {}, releasing as Authenticated",
+                    remote_id
+                );
                 release_in_flight(self.auth_state.clone(), remote_id, AuthState::Authenticated)
                     .await
                     .ok();
@@ -35,6 +40,10 @@ impl ProtocolHandler for Authenticator {
                         "[accept] authentication failed and blocking {}: {}",
                         public_key, msg
                     );
+                    trace!(
+                        "[accept] releasing {} as Blocked after accept failure",
+                        remote_id
+                    );
                     release_in_flight(self.auth_state.clone(), remote_id, AuthState::Blocked)
                         .await
                         .ok();
@@ -42,6 +51,10 @@ impl ProtocolHandler for Authenticator {
                 }
                 _ => {
                     warn!("[accept] authentication failed: {}", err);
+                    trace!(
+                        "[accept] releasing {} as Unauthenticated after accept failure",
+                        remote_id
+                    );
                     release_in_flight(
                         self.auth_state.clone(),
                         remote_id,
@@ -54,6 +67,10 @@ impl ProtocolHandler for Authenticator {
             },
             Err(_) => {
                 warn!("[accept] authentication failed: timed out");
+                trace!(
+                    "[accept] releasing {} as Unauthenticated after accept timeout",
+                    remote_id
+                );
                 release_in_flight(
                     self.auth_state.clone(),
                     remote_id,
@@ -77,6 +94,11 @@ impl EndpointHooks for Authenticator {
         conn_info: &'a iroh::endpoint::ConnectionInfo,
     ) -> iroh::endpoint::AfterHandshakeOutcome {
         let endpoint_id = conn_info.remote_id();
+        trace!(
+            "[after_handshake] entered for {} with alpn {}",
+            endpoint_id,
+            String::from_utf8_lossy(conn_info.alpn())
+        );
         if self.is_authenticated(&endpoint_id).await {
             debug!("[after_handshake] already authenticated: {}", endpoint_id);
             return AfterHandshakeOutcome::accept();
@@ -94,6 +116,11 @@ impl EndpointHooks for Authenticator {
         let in_flight_watcher = if let Some(watchable) =
             get_auth_state(self.auth_state.clone(), endpoint_id).await
         {
+            trace!(
+                "[after_handshake] found auth state for {}: {}",
+                endpoint_id,
+                watchable.state()
+            );
             match watchable.state() {
                 AuthState::Unauthenticated => {
                     debug!("[after_handshake] no in-flight auth for {}, we are asymetric (the other node successfully authed but we didn't), initiating auth ourself",endpoint_id);
@@ -190,22 +217,46 @@ impl EndpointHooks for Authenticator {
         };
 
         let wait_for_auth = async {
+            trace!(
+                "[after_handshake] subscribing to auth state updates for {}",
+                endpoint_id
+            );
             let mut stream = in_flight_watcher.watch().stream();
             while let Some(in_flight) = stream.next().await {
+                trace!(
+                    "[after_handshake] observed auth state update for {} -> {}",
+                    endpoint_id, in_flight
+                );
                 if matches!(
                     in_flight,
                     AuthState::Unauthenticated | AuthState::Authenticated | AuthState::Blocked
                 ) {
+                    trace!(
+                        "[after_handshake] terminal auth state {} reached for {}",
+                        in_flight, endpoint_id
+                    );
                     return;
                 }
             }
+            warn!(
+                "[after_handshake] auth state watch stream ended unexpectedly for {}",
+                endpoint_id
+            );
         };
 
         match timeout(AUTH_TIMEOUT, wait_for_auth).await {
             Ok(_) => {
                 if self.is_authenticated(&endpoint_id).await {
+                    trace!(
+                        "[after_handshake] auth completed successfully for {}",
+                        endpoint_id
+                    );
                     AfterHandshakeOutcome::accept()
                 } else {
+                    warn!(
+                        "[after_handshake] auth wait finished for {} but endpoint is not authenticated",
+                        endpoint_id
+                    );
                     AfterHandshakeOutcome::Reject {
                         error_code: VarInt::from_u32(401),
                         reason: b"Authentication failed".to_vec(),
@@ -231,6 +282,11 @@ impl EndpointHooks for Authenticator {
         alpn: &'a [u8],
     ) -> iroh::endpoint::BeforeConnectOutcome {
         let remote_id = remote_addr.id;
+        trace!(
+            "[before_connect] entered for {} with alpn {}",
+            remote_id,
+            String::from_utf8_lossy(alpn)
+        );
         if self.is_authenticated(&remote_id).await {
             debug!("[before_connect] already authenticated: {}", remote_id);
             return iroh::endpoint::BeforeConnectOutcome::Accept;
@@ -246,7 +302,7 @@ impl EndpointHooks for Authenticator {
         }
 
         match register_in_flight(self.auth_state.clone(), remote_id).await {
-            Ok(RegisterResponse::InFlightRegistered) => {
+            Ok(RegisterResponse::InFlightRegistered) | Ok(RegisterResponse::AlreadyInFlight) => {
                 debug!(
                     "[before_connect] registered in-flight auth for {}, performing auth",
                     remote_id
@@ -273,7 +329,11 @@ impl EndpointHooks for Authenticator {
                     iroh::endpoint::BeforeConnectOutcome::Accept
                 }
             }
-            Ok(RegisterResponse::AlreadyInFlight) | Ok(RegisterResponse::AlreadyAuthenticated) => {
+            Ok(RegisterResponse::AlreadyAuthenticated) => {
+                trace!(
+                    "[before_connect] auth already in progress or complete for {}, allowing connect to proceed",
+                    remote_id
+                );
                 if self.is_authenticated(&remote_id).await {
                     debug!(
                     "[before_connect] already authenticated (in flight), accepting connection to {}",
@@ -304,21 +364,58 @@ pub(crate) async fn register_in_flight(
     in_flight: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
     endpoint_id: PublicKey,
 ) -> Result<RegisterResponse, InFlightError> {
+    trace!(
+        "[register_in_flight] locking auth cache for {}",
+        endpoint_id
+    );
     let mut guard = in_flight.lock().await;
+    trace!(
+        "[register_in_flight] auth cache locked for {}, current size {}",
+        endpoint_id,
+        guard.len()
+    );
     if let Some(entry) = guard.get(&endpoint_id) {
-        return match entry.state() {
+        let current_state = entry.state();
+        trace!(
+            "[register_in_flight] existing state for {} is {}",
+            endpoint_id, current_state
+        );
+        return match current_state {
             AuthState::Unauthenticated => {
                 entry.set_state(AuthState::InFlight);
+                trace!(
+                    "[register_in_flight] endpoint {} promoted from Unauthenticated to InFlight",
+                    endpoint_id
+                );
                 Ok(RegisterResponse::InFlightRegistered)
             }
-            AuthState::Authenticated => Ok(RegisterResponse::AlreadyAuthenticated),
-            AuthState::InFlight => Ok(RegisterResponse::AlreadyInFlight),
-            AuthState::Blocked => Ok(RegisterResponse::AlreadyBlocked),
+            AuthState::Authenticated => {
+                trace!(
+                    "[register_in_flight] endpoint {} already authenticated",
+                    endpoint_id
+                );
+                Ok(RegisterResponse::AlreadyAuthenticated)
+            }
+            AuthState::InFlight => {
+                trace!(
+                    "[register_in_flight] endpoint {} already has auth in flight",
+                    endpoint_id
+                );
+                Ok(RegisterResponse::AlreadyInFlight)
+            }
+            AuthState::Blocked => {
+                trace!("[register_in_flight] endpoint {} is blocked", endpoint_id);
+                Ok(RegisterResponse::AlreadyBlocked)
+            }
         };
     }
 
     let watchable = WatchableRemote::new(endpoint_id);
     watchable.set_state(AuthState::InFlight);
+    trace!(
+        "[register_in_flight] inserting new auth state entry for {} as InFlight",
+        endpoint_id
+    );
 
     if let Some(evicted) = guard.put(endpoint_id, watchable) {
         debug!(
@@ -335,18 +432,38 @@ pub(crate) async fn release_in_flight(
     endpoint_id: PublicKey,
     target_state: AuthState,
 ) -> Result<(), InFlightError> {
+    trace!(
+        "[release_in_flight] requested state release for {} -> {}",
+        endpoint_id, target_state
+    );
     if target_state == AuthState::InFlight {
         return Err(InFlightError::PromotionNotAllowed(
             "cannot release by promoting to InFlight".to_string(),
         ));
     }
+    trace!("[release_in_flight] locking auth cache for {}", endpoint_id);
     let mut guard = in_flight.lock().await;
+    trace!(
+        "[release_in_flight] auth cache locked for {}, current size {}",
+        endpoint_id,
+        guard.len()
+    );
 
     // occupied
     if let Some(entry) = guard.get(&endpoint_id) {
-        return match entry.state() {
+        let current_state = entry.state();
+        let target_state_for_logs = target_state.clone();
+        trace!(
+            "[release_in_flight] current state for {} is {}, target {}",
+            endpoint_id, current_state, target_state_for_logs
+        );
+        return match current_state {
             AuthState::InFlight => {
                 entry.set_state(target_state);
+                trace!(
+                    "[release_in_flight] endpoint {} released from InFlight to {}",
+                    endpoint_id, target_state_for_logs
+                );
                 Ok(())
             }
             AuthState::Authenticated => {
@@ -358,13 +475,39 @@ pub(crate) async fn release_in_flight(
                     );
                     Ok(())
                 } else {
-                    debug!(
-                        "endpoint {} is already authenticated, no-op",
-                        endpoint_id
-                    );
+                    trace!("endpoint {} is already authenticated, no-op", endpoint_id);
                     Ok(())
                 }
             }
+            AuthState::Unauthenticated => match target_state {
+                AuthState::Blocked => {
+                    entry.set_state(AuthState::Blocked);
+                    debug!(
+                            "endpoint {} was unauthenticated but is now blocked, updating state to Blocked",
+                            endpoint_id
+                        );
+                    Ok(())
+                }
+                AuthState::Authenticated => {
+                    trace!("promoting endpoint {} from Unauthenticated to Authenticated (this is required because we can have asymetric failures that lead to this state transition)", endpoint_id);
+
+                    entry.set_state(AuthState::Authenticated);
+                    Ok(())
+                }
+                AuthState::Unauthenticated => {
+                    trace!("endpoint {} is already unauthenticated, no-op", endpoint_id);
+                    Ok(())
+                }
+                AuthState::InFlight => {
+                    trace!(
+                        "cannot promote endpoint {} from Unauthenticated back to InFlight",
+                        endpoint_id
+                    );
+                    Err(InFlightError::PromotionNotAllowed(
+                        "cannot promote to InFlight".to_string(),
+                    ))
+                }
+            },
             current_state => {
                 if current_state == target_state {
                     debug!(
@@ -373,6 +516,10 @@ pub(crate) async fn release_in_flight(
                     );
                     Ok(())
                 } else {
+                    warn!(
+                        "[release_in_flight] refusing state overwrite for {} from {} to {}",
+                        endpoint_id, current_state, target_state
+                    );
                     Err(InFlightError::PromotionNotAllowed(format!(
                         "only promote to {} from {} not from {}",
                         target_state,
@@ -386,7 +533,12 @@ pub(crate) async fn release_in_flight(
 
     // vacant
     let watchable = WatchableRemote::new(endpoint_id);
+    let target_state_for_logs = target_state.clone();
     watchable.set_state(target_state);
+    trace!(
+        "[release_in_flight] no auth state entry existed for {}, inserting {}",
+        endpoint_id, target_state_for_logs
+    );
 
     if let Some(evicted) = guard.put(endpoint_id, watchable) {
         debug!(
@@ -402,5 +554,20 @@ pub(crate) async fn get_auth_state(
     auth_state: Arc<Mutex<LruCache<EndpointId, WatchableRemote>>>,
     endpoint_id: PublicKey,
 ) -> Option<WatchableRemote> {
-    auth_state.lock().await.get(&endpoint_id).cloned()
+    trace!("[get_auth_state] locking auth cache for {}", endpoint_id);
+    let mut guard = auth_state.lock().await;
+    let result = guard.get(&endpoint_id).cloned();
+    match result.as_ref() {
+        Some(watchable) => {
+            trace!(
+                "[get_auth_state] found auth state for {}: {}",
+                endpoint_id,
+                watchable.state()
+            );
+        }
+        None => {
+            trace!("[get_auth_state] no auth state found for {}", endpoint_id);
+        }
+    }
+    result
 }
