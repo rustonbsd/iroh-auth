@@ -12,7 +12,7 @@ use tokio::{
     sync::Mutex,
     time::{timeout, Instant},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     protocol::release_in_flight, AuthenticatorError, IntoSecret, ALPN, AUTH_TIMEOUT,
@@ -81,6 +81,21 @@ impl WatchableRemote {
     }
 
     pub fn set_state(&self, state: AuthState) {
+        let previous_state = self.inner.get();
+        if previous_state == state {
+            trace!(
+                "[watchable_remote] endpoint {} state unchanged at {}",
+                self.id,
+                state
+            );
+        } else {
+            trace!(
+                "[watchable_remote] endpoint {} state transition {} -> {}",
+                self.id,
+                previous_state,
+                state
+            );
+        }
         self.inner.set(state).ok();
     }
 }
@@ -125,6 +140,8 @@ impl Authenticator {
         if guard.is_none() {
             *guard = Some(endpoint.clone());
             trace!("Authenticator endpoint set to {}", endpoint.id());
+        } else {
+            trace!("Authenticator endpoint already set, ignoring {}", endpoint.id());
         }
     }
 
@@ -147,17 +164,31 @@ impl Authenticator {
     }
 
     pub async fn is_authenticated(&self, id: &PublicKey) -> bool {
-        self.auth_state
+        let state = self
+            .auth_state
             .lock()
             .await
             .get(id)
-            .map(|watchable| {
-                if watchable.state() == AuthState::Authenticated {
-                    return true;
-                }
+            .map(|watchable| watchable.state());
+
+        match state {
+            Some(AuthState::Authenticated) => {
+                trace!("[is_authenticated] endpoint {} is authenticated", id);
+                true
+            }
+            Some(other) => {
+                trace!(
+                    "[is_authenticated] endpoint {} is not authenticated, current state {}",
+                    id,
+                    other
+                );
                 false
-            })
-            .unwrap_or(false)
+            }
+            None => {
+                trace!("[is_authenticated] endpoint {} has no auth state entry", id);
+                false
+            }
+        }
     }
 
     #[cfg(test)]
@@ -200,6 +231,11 @@ impl Authenticator {
         recv: &mut iroh::endpoint::RecvStream,
         open: bool,
     ) -> Result<(), AuthenticatorError> {
+        let start = Instant::now();
+        trace!(
+            "[end_of_auth] starting shutdown sequence for {} side",
+            if open { "open" } else { "accept" }
+        );
         send.finish().map_err(|err| {
             error!("[end_of_auth] failed to finish stream: {}", err);
             if open {
@@ -241,6 +277,11 @@ impl Authenticator {
         {
             warn!("[end_of_auth] {}", err);
         }
+        trace!(
+            "[end_of_auth] shutdown sequence for {} side completed in {:?}",
+            if open { "open" } else { "accept" },
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -249,7 +290,9 @@ impl Authenticator {
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
     pub(crate) async fn auth_accept(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
-        debug!("[auth_accept] accepting auth connection from {}", remote_id);
+        let start = Instant::now();
+        trace!("[auth_accept] accepting auth connection from {}", remote_id);
+        trace!("[auth_accept] waiting for inbound bidirectional stream from {}", remote_id);
         let (mut send, mut recv) = timeout(TRANSMISSION_TIMEOUT, conn.accept_bi())
             .await
             .map_err(|_| {
@@ -265,6 +308,11 @@ impl Authenticator {
                     err
                 ))
             })?;
+        trace!(
+            "[auth_accept] bidirectional stream accepted from {} after {:?}",
+            remote_id,
+            start.elapsed()
+        );
 
         let (spake, token_b) = Spake2::<Ed25519Group>::start_b(
             &Password::new(self.secret.expose_secret()),
@@ -273,20 +321,25 @@ impl Authenticator {
         );
 
         let mut token_a = [0u8; 33];
+        trace!("[auth_accept] waiting for token_a from {}", remote_id);
         recv.read_exact(&mut token_a).await.map_err(|err| {
             error!("[auth_accept] failed to read token_a: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to read token_a: {}", err))
         })?;
+        trace!("[auth_accept] received token_a from {}", remote_id);
 
+        trace!("[auth_accept] sending token_b to {}", remote_id);
         send.write_all(&token_b).await.map_err(|err| {
             error!("[auth_accept] failed to write token_b: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to write token_b: {}", err))
         })?;
+        trace!("[auth_accept] sent token_b to {}", remote_id);
 
         let shared_secret = spake.finish(&token_a).map_err(|err| {
             error!("[auth_accept] SPAKE2 invalid: {}", err);
             AuthenticatorError::AcceptFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
+        trace!("[auth_accept] derived shared secret for {}", remote_id);
 
         let hk = Hkdf::<Sha512>::new(None, shared_secret.as_slice());
         let mut accept_key = [0u8; 64];
@@ -302,15 +355,18 @@ impl Authenticator {
                 AuthenticatorError::AcceptFailed(format!("Failed to expand open_key: {}", err))
             })?;
 
+        trace!("[auth_accept] sending accept_key to {}", remote_id);
         send.write_all(&accept_key).await.map_err(|err| {
             error!("[auth_accept] failed to write accept_key: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to write accept_key: {}", err))
         })?;
         let mut remote_open_key = [0u8; 64];
+        trace!("[auth_accept] waiting for remote_open_key from {}", remote_id);
         recv.read_exact(&mut remote_open_key).await.map_err(|err| {
             error!("[auth_accept] failed to read remote_open_key: {}", err);
             AuthenticatorError::AcceptFailed(format!("Failed to read remote_open_key: {}", err))
         })?;
+        trace!("[auth_accept] received remote_open_key from {}", remote_id);
 
         let _ = self.end_of_auth(&mut send, &mut recv, false).await;
 
@@ -322,7 +378,11 @@ impl Authenticator {
             ));
         }
 
-        info!("[auth_accept] authenticated connection from {}", remote_id);
+        info!(
+            "[auth_accept] authenticated connection from {} in {:?}",
+            remote_id,
+            start.elapsed()
+        );
 
         Ok(())
     }
@@ -332,7 +392,9 @@ impl Authenticator {
     /// Returns Ok(()) on success, or an AuthenticatorError on failure.
     pub(crate) async fn auth_open(&self, conn: Connection) -> Result<(), AuthenticatorError> {
         let remote_id = conn.remote_id();
-        debug!("[auth_open] opening auth connection to {}", remote_id);
+        let start = Instant::now();
+        trace!("[auth_open] opening auth connection to {}", remote_id);
+        trace!("[auth_open] waiting to open bidirectional stream to {}", remote_id);
         let (mut send, mut recv) = timeout(TRANSMISSION_TIMEOUT, conn.open_bi())
             .await
             .map_err(|_| {
@@ -343,6 +405,11 @@ impl Authenticator {
                 error!("[auth_open] open bidirectional stream failed: {}", err);
                 AuthenticatorError::OpenFailed(format!("Open bidirectional stream failed: {}", err))
             })?;
+        trace!(
+            "[auth_open] bidirectional stream opened to {} after {:?}",
+            remote_id,
+            start.elapsed()
+        );
 
         let (spake, token_a) = Spake2::<Ed25519Group>::start_a(
             &Password::new(self.secret.expose_secret()),
@@ -350,21 +417,26 @@ impl Authenticator {
             &Identity::new(conn.remote_id().as_bytes()),
         );
 
+        trace!("[auth_open] sending token_a to {}", remote_id);
         send.write_all(&token_a).await.map_err(|err| {
             error!("[auth_open] failed to write token_a: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write token_a: {}", err))
         })?;
+        trace!("[auth_open] sent token_a to {}", remote_id);
 
         let mut token_b = [0u8; 33];
+        trace!("[auth_open] waiting for token_b from {}", remote_id);
         recv.read_exact(&mut token_b).await.map_err(|err| {
             error!("[auth_open] failed to read token_b: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to read token_b: {}", err))
         })?;
+        trace!("[auth_open] received token_b from {}", remote_id);
 
         let shared_secret = spake.finish(&token_b).map_err(|err| {
             error!("[auth_open] SPAKE2 invalid: {}", err);
             AuthenticatorError::OpenFailedAndBlock(format!("SPAKE2 invalid: {}", err), remote_id)
         })?;
+        trace!("[auth_open] derived shared secret for {}", remote_id);
 
         let hk = Hkdf::<Sha512>::new(None, shared_secret.as_slice());
         let mut accept_key = [0u8; 64];
@@ -381,12 +453,14 @@ impl Authenticator {
             })?;
 
         let mut remote_accept_key = [0u8; 64];
+        trace!("[auth_open] waiting for remote_accept_key from {}", remote_id);
         recv.read_exact(&mut remote_accept_key)
             .await
             .map_err(|err| {
                 error!("[auth_open] failed to read remote_accept_key: {}", err);
                 AuthenticatorError::OpenFailed(format!("Failed to read remote_accept_key: {}", err))
             })?;
+        trace!("[auth_open] received remote_accept_key from {}", remote_id);
 
         if !bool::from(remote_accept_key.ct_eq(&accept_key)) {
             error!("[auth_open] remote accept_key mismatch");
@@ -403,13 +477,18 @@ impl Authenticator {
             ));
         }
 
+        trace!("[auth_open] sending open_key to {}", remote_id);
         send.write_all(&open_key).await.map_err(|err| {
             error!("[auth_open] failed to write open_key: {}", err);
             AuthenticatorError::OpenFailed(format!("Failed to write open_key: {}", err))
         })?;
         let _ = self.end_of_auth(&mut send, &mut recv, true).await;
 
-        info!("[auth_open] authenticated connection to {}", remote_id);
+        info!(
+            "[auth_open] authenticated connection to {} in {:?}",
+            remote_id,
+            start.elapsed()
+        );
 
         Ok(())
     }
@@ -422,6 +501,8 @@ impl Authenticator {
         endpoint: Endpoint,
     ) -> Result<(), AuthenticatorError> {
         let start_time = Instant::now();
+        let mut attempt = 0usize;
+        trace!("[perform_auth] starting authentication workflow for {}", remote_id);
         if let Err(err) = timeout(AUTH_TIMEOUT, endpoint.online()).await.map_err(|_| {
             AuthenticatorError::OpenFailed(
                 "[before_connect] awaiting endpoint.online() timed out".to_string(),
@@ -445,11 +526,20 @@ impl Authenticator {
             })?;
             return Err(err);
         }
+        trace!(
+            "[perform_auth] endpoint is online for {}, entering retry loop after {:?}",
+            remote_id,
+            start_time.elapsed()
+        );
 
         while start_time.elapsed() < AUTH_TIMEOUT {
-            debug!(
-                "[before_connect] background: connecting to {} for auth",
-                remote_id
+            attempt += 1;
+            let attempt_start = Instant::now();
+            trace!(
+                "[perform_auth] attempt {} connecting to {} with {:?} remaining",
+                attempt,
+                remote_id,
+                remaining_timeout(start_time, AUTH_TIMEOUT)
             );
             match timeout(
                 remaining_timeout(start_time, AUTH_TIMEOUT),
@@ -458,9 +548,11 @@ impl Authenticator {
             .await
             {
                 Ok(Ok(conn)) => {
-                    debug!(
-                        "[before_connect] connected to {}, performing auth",
-                        remote_id
+                    trace!(
+                        "[perform_auth] attempt {} connected to {} after {:?}, starting auth_open",
+                        attempt,
+                        remote_id,
+                        attempt_start.elapsed()
                     );
                     match timeout(
                         remaining_timeout(start_time, AUTH_TIMEOUT),
@@ -469,9 +561,11 @@ impl Authenticator {
                     .await
                     {
                         Ok(Ok(())) => {
-                            debug!(
-                                "[before_connect] authentication successful for {}",
-                                remote_id
+                            trace!(
+                                "[perform_auth] attempt {} authentication successful for {} after {:?}",
+                                attempt,
+                                remote_id,
+                                attempt_start.elapsed()
                             );
 
                             release_in_flight(
@@ -490,13 +584,21 @@ impl Authenticator {
                                     remote_id, err
                                 ))
                             })?;
+                            info!(
+                                "[perform_auth] authentication workflow for {} completed successfully in {:?}",
+                                remote_id,
+                                start_time.elapsed()
+                            );
                             return Ok(());
                         }
                         Ok(Err(err)) => match &err {
                             AuthenticatorError::OpenFailedAndBlock(msg, public_key) => {
                                 warn!(
-                                    "[before_connect] authentication failed and blocking {}: {}",
-                                    public_key, msg
+                                    "[perform_auth] attempt {} authentication failed and blocking {} after {:?}: {}",
+                                    attempt,
+                                    public_key,
+                                    attempt_start.elapsed(),
+                                    msg
                                 );
                                 release_in_flight(
                                     self.auth_state.clone(),
@@ -517,38 +619,51 @@ impl Authenticator {
                             }
                             _ => {
                                 warn!(
-                                    "[before_connect] authentication failed for {}: {}",
-                                    remote_id, err
+                                    "[perform_auth] attempt {} authentication failed for {} after {:?}: {}",
+                                    attempt,
+                                    remote_id,
+                                    attempt_start.elapsed(),
+                                    err
                                 );
                             }
                         },
                         Err(_) => {
                             warn!(
-                                "[before_connect] authentication timed out for {}, retrying...",
-                                remote_id
+                                "[perform_auth] attempt {} auth_open timed out for {} after {:?}, retrying",
+                                attempt,
+                                remote_id,
+                                attempt_start.elapsed()
                             );
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     warn!(
-                            "[before_connect] failed to open connection for authentication to {}: {}, retrying...",
-                            remote_id, e
+                            "[perform_auth] attempt {} failed to connect auth channel to {} after {:?}: {}, retrying",
+                            attempt, remote_id, attempt_start.elapsed(), e
                         );
                 }
                 Err(e) => {
                     warn!(
-                        "[before_connect] connection attempt timed out for {}: {}, retrying...",
-                        remote_id, e
+                        "[perform_auth] attempt {} connection timed out for {} after {:?}: {}, retrying",
+                        attempt, remote_id, attempt_start.elapsed(), e
                     );
                 }
             };
+            trace!(
+                "[perform_auth] attempt {} for {} sleeping before retry with {:?} remaining",
+                attempt,
+                remote_id,
+                remaining_timeout(start_time, AUTH_TIMEOUT)
+            );
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         warn!(
-            "[before_connect] background: authentication timed out for {}",
-            remote_id
+            "[perform_auth] authentication workflow timed out for {} after {} attempts and {:?}",
+            remote_id,
+            attempt,
+            start_time.elapsed()
         );
 
         // Timeout no more retries, clean up in-flight state
