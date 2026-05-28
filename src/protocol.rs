@@ -3,10 +3,11 @@ use std::sync::Arc;
 use iroh::{
     endpoint::{AfterHandshakeOutcome, EndpointHooks, VarInt},
     protocol::ProtocolHandler,
-    EndpointId, PublicKey, Watcher,
+    EndpointId, PublicKey,
 };
 use lru::LruCache;
 use n0_future::StreamExt;
+use n0_watcher::Watcher;
 use tokio::{sync::Mutex, time::timeout};
 use tracing::{debug, error, info, trace, warn};
 
@@ -91,23 +92,23 @@ impl ProtocolHandler for Authenticator {
 impl EndpointHooks for Authenticator {
     async fn after_handshake<'a>(
         &'a self,
-        conn_info: &'a iroh::endpoint::ConnectionInfo,
+        conn: &'a iroh::endpoint::Connection,
     ) -> iroh::endpoint::AfterHandshakeOutcome {
-        let endpoint_id = conn_info.remote_id();
+        let endpoint_id = conn.remote_id();
         trace!(
             "[after_handshake] entered for {} with alpn {}",
             endpoint_id,
-            String::from_utf8_lossy(conn_info.alpn())
+            String::from_utf8_lossy(conn.alpn())
         );
         if self.is_authenticated(&endpoint_id).await {
             debug!("[after_handshake] already authenticated: {}", endpoint_id);
             return AfterHandshakeOutcome::accept();
         }
 
-        if conn_info.alpn() == ALPN {
+        if conn.alpn() == ALPN {
             debug!(
                 "[after_handshake] accepting auth connection: {}",
-                String::from_utf8_lossy(conn_info.alpn())
+                String::from_utf8_lossy(conn.alpn())
             );
             return AfterHandshakeOutcome::accept();
         }
@@ -190,7 +191,7 @@ impl EndpointHooks for Authenticator {
                 AuthState::Authenticated => {
                     debug!(
                         "[after_handshake] already authenticated: {}",
-                        conn_info.remote_id()
+                        conn.remote_id()
                     );
                     return AfterHandshakeOutcome::accept();
                 }
@@ -225,7 +226,8 @@ impl EndpointHooks for Authenticator {
             while let Some(in_flight) = stream.next().await {
                 trace!(
                     "[after_handshake] observed auth state update for {} -> {}",
-                    endpoint_id, in_flight
+                    endpoint_id,
+                    in_flight
                 );
                 if matches!(
                     in_flight,
@@ -233,7 +235,8 @@ impl EndpointHooks for Authenticator {
                 ) {
                     trace!(
                         "[after_handshake] terminal auth state {} reached for {}",
-                        in_flight, endpoint_id
+                        in_flight,
+                        endpoint_id
                     );
                     return;
                 }
@@ -378,7 +381,8 @@ pub(crate) async fn register_in_flight(
         let current_state = entry.state();
         trace!(
             "[register_in_flight] existing state for {} is {}",
-            endpoint_id, current_state
+            endpoint_id,
+            current_state
         );
         return match current_state {
             AuthState::Unauthenticated => {
@@ -434,7 +438,8 @@ pub(crate) async fn release_in_flight(
 ) -> Result<(), InFlightError> {
     trace!(
         "[release_in_flight] requested state release for {} -> {}",
-        endpoint_id, target_state
+        endpoint_id,
+        target_state
     );
     if target_state == AuthState::InFlight {
         return Err(InFlightError::PromotionNotAllowed(
@@ -455,14 +460,17 @@ pub(crate) async fn release_in_flight(
         let target_state_for_logs = target_state.clone();
         trace!(
             "[release_in_flight] current state for {} is {}, target {}",
-            endpoint_id, current_state, target_state_for_logs
+            endpoint_id,
+            current_state,
+            target_state_for_logs
         );
         return match current_state {
             AuthState::InFlight => {
                 entry.set_state(target_state);
                 trace!(
                     "[release_in_flight] endpoint {} released from InFlight to {}",
-                    endpoint_id, target_state_for_logs
+                    endpoint_id,
+                    target_state_for_logs
                 );
                 Ok(())
             }
@@ -537,7 +545,8 @@ pub(crate) async fn release_in_flight(
     watchable.set_state(target_state);
     trace!(
         "[release_in_flight] no auth state entry existed for {}, inserting {}",
-        endpoint_id, target_state_for_logs
+        endpoint_id,
+        target_state_for_logs
     );
 
     if let Some(evicted) = guard.put(endpoint_id, watchable) {
