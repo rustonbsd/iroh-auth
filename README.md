@@ -21,8 +21,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-iroh = "1.0.0-rc.1"
-iroh-auth = "0.2.0-pre.1"
+iroh = "1"
+iroh-auth = "0.2"
 ```
 
 ## Usage
