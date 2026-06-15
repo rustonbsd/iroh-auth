@@ -1,6 +1,6 @@
 [package]
 name = "iroh-auth"
-version = "0.2.0-pre.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["rustonbsd <rustonbsd@mailfence.com>"]
 description = "Authentication middleware for iroh"
@@ -12,15 +12,15 @@ categories = ["network-programming"]
 
 
 [dependencies]
-iroh = { version = "1.0.0-rc.1" }
+iroh = { version = "1" }
 spake2 = { version = "0.4" }
-hkdf = { version = "0.12" }
+hkdf = { version = "0.13.0" }
 secrecy = { version = "0.10" }
-sha2 = { version = "0.10" }
+sha2 = { version = "0.11.0" }
 subtle = { version = "2.6" }
 rand = { version = "0.10" }
 n0-future = { version = "0.3" }
-n0-watcher = { version = "0.6" }
+n0-watcher = { version = "1" }
 tracing = { version = "0.1" }
 tokio = { version = "1", features = [
     "macros",
@@ -30,7 +30,7 @@ tokio = { version = "1", features = [
 ] }
 lru = { version = "0.18" }
 
-iroh-gossip = { version = "0.100", optional = true }
+iroh-gossip = { version = "0.101", optional = true }
 anyhow = { version = "1", optional = true }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
