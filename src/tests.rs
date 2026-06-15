@@ -94,10 +94,7 @@ async fn test_auth_asymmetric_retry() {
         .expect("Auth asymmetric retry test failed"));
 }
 
-async fn run_auth_test(
-    secret_a: &'static [u8],
-    secret_b: &'static [u8],
-) -> Result<bool, String> {
+async fn run_auth_test(secret_a: &'static [u8], secret_b: &'static [u8]) -> Result<bool, String> {
     let auth_a = Authenticator::new(secret_a);
     let endpoint_a = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .alpns(vec![b"/dummy/1".to_vec()])
@@ -240,16 +237,14 @@ async fn run_auth_parallel_test(
 
     let wait_loop = async {
         let wait_a = async {
-            while auth_a.list_authenticated().await.len() + auth_a.list_blocked().await.len()
-                < 1
+            while auth_a.list_authenticated().await.len() + auth_a.list_blocked().await.len() < 1
                 || success.load(std::sync::atomic::Ordering::SeqCst) < parallel_count
             {
                 time::sleep(Duration::from_millis(1000)).await;
             }
         };
         let wait_b = async {
-            while auth_b.list_authenticated().await.len() + auth_b.list_blocked().await.len()
-                < 1
+            while auth_b.list_authenticated().await.len() + auth_b.list_blocked().await.len() < 1
                 || success.load(std::sync::atomic::Ordering::SeqCst) < parallel_count
             {
                 time::sleep(Duration::from_millis(1000)).await;
@@ -336,7 +331,19 @@ async fn run_auth_asymmetric_retry_test(secret: &'static [u8]) -> Result<bool, S
         .map_err(|_| "Authentication retry did not complete in time".to_string())?
         .map_err(|e| e.to_string())?;
 
-    time::sleep(Duration::from_millis(250)).await;
+    let check_is_authed = async {
+        loop {
+            if auth_a.is_authenticated(&endpoint_b.id()).await
+                && auth_b.is_authenticated(&endpoint_a.id()).await
+            {
+                break;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout(AUTH_TIMEOUT, check_is_authed)
+        .await
+        .map_err(|_| "Authenticated state not reached in time".to_string())?;
 
     let a_authenticated = auth_a.is_authenticated(&endpoint_b.id()).await;
     let b_authenticated = auth_b.is_authenticated(&endpoint_a.id()).await;
@@ -358,9 +365,11 @@ async fn run_auth_asymmetric_retry_test(secret: &'static [u8]) -> Result<bool, S
 #[tokio::test(flavor = "multi_thread")]
 async fn test_auth_late_failure_does_not_clear_authenticated() {
     let secret = b"supersecrettoken1234567890123456";
-    assert!(run_auth_late_failure_does_not_clear_authenticated_test(secret)
-        .await
-        .expect("late failure regression test failed"));
+    assert!(
+        run_auth_late_failure_does_not_clear_authenticated_test(secret)
+            .await
+            .expect("late failure regression test failed")
+    );
 }
 
 async fn run_auth_late_failure_does_not_clear_authenticated_test(
